@@ -2,12 +2,37 @@
 
 ## Overview
 
-This document designs a library that wraps the pull-mode Event Hub consumer internals into a clean, user-facing API. The library handles all infrastructure concerns (partition ownership, ETag-based load balancing, rebalancing, AMQP connections) and exposes two simple operations to the caller:
+This document defines the **public contract** for a pull-mode Event Hub consumer library built on top of `EventHubConsumerClient` and `PartitionReceiver`.
 
-1. **`FetchAsync`** — fetch one event per owned partition on demand, optionally limited to a random subset of partitions
-2. **`UpdateCheckpointAsync`** — advance the checkpoint for a partition after the caller has finished processing
+The library owns the infrastructure concerns:
+- Partition ownership
+- ETag-based load balancing
+- Ownership renewal and rebalance
+- AMQP receiver lifecycle
+- Checkpoint persistence
 
-The caller is responsible for the work that happens between these two calls. The library never auto-checkpoints.
+The caller owns the processing window between fetch and checkpoint.
+
+The v1 surface area is intentionally small:
+
+1. **`StartAsync`** initializes ownership, restores checkpoints, and opens receivers.
+2. **`FetchAsync`** fetches at most one event per queried partition on demand.
+3. **`UpdateCheckpointAsync`** advances the checkpoint only after caller processing is complete.
+
+The library **never auto-checkpoints**.
+
+---
+
+## Canonical Contract
+
+These rules are the source of truth for the implementation and for the internals document:
+
+- Checkpointing is always explicit.
+- `FetchAsync` is serialized internally; callers do not need to coordinate concurrent fetch calls.
+- Each fetch returns at most one event per queried partition.
+- A fetched event is safe to hold across awaits or queue boundaries, but its checkpoint token can become stale after rebalance.
+- `UpdateCheckpointAsync` only moves checkpoints forward; it never rewinds them.
+- Rebalancing is transparent to fetching, but duplicate delivery remains possible and callers must be idempotent.
 
 ---
 
@@ -15,12 +40,13 @@ The caller is responsible for the work that happens between these two calls. The
 
 | Principle | Rationale |
 |-----------|-----------|
-| **Explicit checkpointing** | Checkpoint timing is a business decision — the library must not advance it automatically |
-| **Caller owns the processing window** | The gap between `FetchAsync` and `UpdateCheckpointAsync` is where user work happens; the library must not interfere |
-| **At-least-once by default** | Checkpoint only after successful processing; a crash before `UpdateCheckpointAsync` causes the event to be re-delivered on next startup |
-| **Partition context is opaque** | The caller receives a `FetchedEvent` handle — not a raw partition ID string — to prevent misuse (e.g. checkpointing the wrong partition) |
-| **Non-concurrent fetch** | The library serializes concurrent `FetchAsync` calls internally; callers do not need to worry about it |
-| **Lifecycle is explicit** | `StartAsync` / `DisposeAsync` are explicit; the library does nothing until started |
+| **Explicit checkpointing** | Checkpoint timing is a business decision; the library must not advance it automatically |
+| **Caller owns the processing window** | The gap between `FetchAsync` and `UpdateCheckpointAsync` is where user work happens |
+| **At-least-once by default** | A crash before checkpoint causes re-delivery from the prior checkpoint |
+| **Opaque partition context** | The caller receives a `FetchedEvent` handle instead of composing checkpoint coordinates manually |
+| **Non-concurrent fetch** | The library serializes `FetchAsync` to avoid concurrent reads on the same `PartitionReceiver` |
+| **Monotonic checkpoints** | A later checkpoint must never be replaced by an older one |
+| **Explicit lifecycle** | `StartAsync` / `DisposeAsync` are required; the library does nothing before startup |
 
 ---
 
@@ -28,12 +54,12 @@ The caller is responsible for the work that happens between these two calls. The
 
 ### `FetchedEvent`
 
-The unit returned by `FetchAsync`. Carries the event data and the opaque context needed to checkpoint it. The caller must not inspect or store partition internals — only pass this back to `UpdateCheckpointAsync`.
+The unit returned by `FetchAsync`. It carries the event data plus the opaque token needed for a later checkpoint attempt.
 
 ```csharp
 /// <summary>
-/// An event fetched from a single Event Hub partition, along with the
-/// context required to checkpoint it after processing.
+/// An event fetched from a single Event Hub partition, together with the
+/// opaque token required to attempt a checkpoint later.
 /// </summary>
 public sealed class FetchedEvent
 {
@@ -52,18 +78,23 @@ public sealed class FetchedEvent
     /// <summary>UTC time the event was enqueued in Event Hubs.</summary>
     public DateTimeOffset EnqueuedTime { get; }
 
-    // Internal: opaque checkpoint token; not exposed to caller
+    // Internal: includes partition ID, sequence/offset, and ownership epoch.
     internal CheckpointToken CheckpointToken { get; }
 }
 ```
 
-`FetchedEvent` is **immutable** and **not tied to any live resource** — it is safe to hold across awaits, store in a queue, or pass across threads.
+`FetchedEvent` is **immutable** and **not tied to any live resource**. It is safe to hold across awaits, place in a queue, or pass across threads.
+
+What is *not* guaranteed is that its checkpoint token remains valid forever. A later call to `UpdateCheckpointAsync` can return `false` if:
+- the partition was rebalanced away,
+- the token belongs to an older ownership epoch, or
+- the checkpoint has already advanced to this event or beyond it.
 
 ---
 
 ### `FetchResult`
 
-The return value of `FetchAsync`. Contains one `FetchedEvent` per partition that had an available event. Partitions with no events are omitted.
+The return value of `FetchAsync`. It contains one `FetchedEvent` per queried partition that had an event available within the fetch wait window.
 
 ```csharp
 /// <summary>
@@ -74,19 +105,17 @@ public sealed class FetchResult
 {
     /// <summary>
     /// Events received, keyed by partition ID.
-    /// Only partitions that had an available event are included.
+    /// Only partitions that produced an event are included.
     /// </summary>
     public IReadOnlyDictionary<string, FetchedEvent> Events { get; }
 
     /// <summary>
-    /// Partitions that were queried but had no available event.
-    /// When using FetchAsync(maxPartitions), only the selected partitions
-    /// appear here — not all owned partitions.
+    /// Partitions that were queried but produced no event within FetchWaitTime.
     /// </summary>
     public IReadOnlyCollection<string> EmptyPartitions { get; }
 
     /// <summary>
-    /// Partitions that were queried in this fetch (selected subset or all owned).
+    /// Partitions included in this fetch attempt.
     /// QueriedPartitions = Events.Keys ∪ EmptyPartitions.
     /// </summary>
     public IReadOnlyCollection<string> QueriedPartitions { get; }
@@ -100,7 +129,7 @@ public sealed class FetchResult
 
 ### `IEventHubPullConsumer`
 
-The primary library interface. Designed to be easily mockable in unit tests.
+The primary library interface. It is designed to be mockable in unit tests and small enough to use comfortably from a hosted service.
 
 ```csharp
 /// <summary>
@@ -112,72 +141,55 @@ public interface IEventHubPullConsumer : IAsyncDisposable
 {
     /// <summary>
     /// Initialize the consumer: discover partitions, claim ownership,
-    /// restore checkpoints, open AMQP receivers.
+    /// restore checkpoints, and open receivers.
     /// Must be called before FetchAsync.
     /// </summary>
     Task StartAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Fetch one event from each owned partition concurrently.
-    /// Returns immediately with whatever is available; does not block
-    /// until all partitions have events.
+    /// Fetch at most one event from each currently owned partition.
     ///
-    /// Only partitions that had an available event within FetchWaitTime
-    /// are included in FetchResult.Events.
-    ///
-    /// Does NOT advance any checkpoint — the caller must call
-    /// UpdateCheckpointAsync after processing.
+    /// The library serializes concurrent FetchAsync calls internally.
+    /// No checkpoint is advanced automatically.
     /// </summary>
     Task<FetchResult> FetchAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Fetch one event from up to <paramref name="maxPartitions"/> randomly
-    /// selected owned partitions concurrently.
+    /// Fetch at most one event from up to <paramref name="maxPartitions"/>
+    /// currently owned partitions.
     ///
-    /// If <paramref name="maxPartitions"/> >= owned partition count, this
-    /// behaves identically to the parameterless overload (fetches from all).
+    /// Partition selection is implementation-defined but must be fair over time
+    /// (for example, round-robin or shuffled rotation). Callers must not depend
+    /// on a specific selection order.
     ///
-    /// Partition selection is randomized on each call to distribute load
-    /// evenly across partitions over time, avoiding starvation.
-    ///
-    /// Does NOT advance any checkpoint — the caller must call
-    /// UpdateCheckpointAsync after processing.
+    /// If <paramref name="maxPartitions"/> is greater than or equal to the
+    /// number of owned partitions, this behaves like the parameterless overload.
+    /// No checkpoint is advanced automatically.
     /// </summary>
-    /// <param name="maxPartitions">
-    /// Maximum number of owned partitions to fetch from. Partitions are
-    /// selected randomly from the current owned set.
-    /// </param>
-    Task<FetchResult> FetchAsync(
-        int maxPartitions,
-        CancellationToken cancellationToken = default);
+    Task<FetchResult> FetchAsync(int maxPartitions, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Advance the checkpoint for the partition that produced this event.
-    /// Call this after all processing on the event is complete and durable.
+    /// Attempt to advance the checkpoint for the partition that produced this event.
     ///
-    /// If this instance no longer owns the partition (ownership lost), the call
-    /// is a no-op and returns false.
+    /// Returns true only when the stored checkpoint moved forward.
+    /// Returns false when the token is stale, the partition is no longer owned,
+    /// or the checkpoint is already at or beyond this event.
     /// </summary>
-    /// <param name="fetchedEvent">The event returned by a previous FetchAsync call.</param>
-    /// <returns>True if the checkpoint was written; false if the partition is no longer owned.</returns>
-    Task<bool> UpdateCheckpointAsync(
-        FetchedEvent fetchedEvent,
-        CancellationToken cancellationToken = default);
+    Task<bool> UpdateCheckpointAsync(FetchedEvent fetchedEvent, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// The set of partition IDs currently owned by this instance.
+    /// The partitions currently owned by this instance.
     /// This set changes over time as rebalancing occurs.
     /// </summary>
     IReadOnlyCollection<string> OwnedPartitions { get; }
 
     /// <summary>
-    /// Raised when this instance acquires ownership of a new partition.
+    /// Raised when this instance acquires a partition.
     /// </summary>
     event EventHandler<PartitionOwnershipChangedEventArgs> PartitionAcquired;
 
     /// <summary>
-    /// Raised when this instance loses ownership of a partition
-    /// (stolen by another instance, ownership expiry, or graceful release).
+    /// Raised when this instance loses a partition.
     /// </summary>
     event EventHandler<PartitionOwnershipChangedEventArgs> PartitionLost;
 }
@@ -196,28 +208,85 @@ public sealed class PartitionOwnershipChangedEventArgs : EventArgs
 
 public enum PartitionOwnershipChangeReason
 {
-    Acquired,              // acquired on startup or rebalance
-    Stolen,                // another instance stole via ETag race (412 on renewal)
-    OwnershipExpired,      // ownership record expired (instance failed to renew in time)
-    Rebalanced,            // actively given up to balance across instances
-    Shutdown               // released during graceful DisposeAsync
+    Acquired,
+    Stolen,
+    Expired,
+    Rebalanced,
+    Shutdown
 }
 ```
 
 ---
 
+## Fetch Semantics
+
+### Parameterless `FetchAsync`
+
+`FetchAsync()` queries every partition currently owned by this instance and returns at most one event per partition.
+
+If a partition has no event available within `FetchWaitTime`, that partition appears in `EmptyPartitions` rather than `Events`.
+
+### `FetchAsync(maxPartitions)`
+
+`FetchAsync(maxPartitions)` queries only a subset of the currently owned partitions.
+
+The library should use a **fair** selection strategy over time. The contract intentionally does not require pure randomness because fairness is the real goal, not a specific RNG choice. A round-robin cursor or shuffled ring is preferred over re-sorting the full owned set on every call.
+
+### Serialization
+
+The library serializes concurrent `FetchAsync` calls internally. This keeps the public API simple and avoids concurrent reads on the same `PartitionReceiver`.
+
+### Prefetch Caveat
+
+Limiting `maxPartitions` limits which receivers are *drained* during a fetch call. It does **not** guarantee that no events are already buffered for non-selected partitions when receivers are long-lived and prefetch is enabled.
+
+For stricter pull fidelity:
+- keep `PrefetchCount` low,
+- prefer `PrefetchCount = 0` or `1`, and
+- treat `maxPartitions` as a scheduling limit, not a hard upstream isolation boundary.
+
+---
+
+## Checkpoint Semantics
+
+The library enforces **at-least-once delivery** by default:
+
+```text
+FetchAsync() -> caller processes -> UpdateCheckpointAsync() -> checkpoint advances
+```
+
+If the process crashes before checkpoint, the next owner resumes from the prior checkpoint and the event may be delivered again.
+
+### Monotonic Advance
+
+Checkpoints only move forward. `UpdateCheckpointAsync` returns `false` when:
+- the stored checkpoint is already at this sequence number or beyond it,
+- the `FetchedEvent` belongs to an older ownership epoch, or
+- the library can tell the partition is no longer owned by this instance.
+
+This protects the common case where:
+- an older queued event is checkpointed after a newer one, or
+- a rebalance makes a previously fetched event stale.
+
+### Ownership Validation
+
+The internal checkpoint token includes the partition's **ownership epoch** at fetch time. `UpdateCheckpointAsync` validates that epoch before attempting the checkpoint write.
+
+This blocks obviously stale checkpoint attempts after rebalance, but it is still **not a distributed transaction** across the ownership blob and the checkpoint blob. Idempotent processing is still required.
+
+---
+
 ## Usage Pattern
 
-The consumer is registered through dependency injection and injected into a `BackgroundService`. The library does not dictate the outer loop structure:
+The consumer is typically registered through dependency injection and used from a `BackgroundService`. The library does not dictate the outer polling loop.
 
 ```csharp
-// In Program.cs / Startup.cs — register the consumer
+// In Program.cs / Startup.cs
 services.Configure<EventHubPullConsumerOptions>(config.GetSection("EventHubPullConsumer"));
 services.AddSingleton<IEventHubPullConsumer, EventHubPullConsumer>();
 ```
 
 ```csharp
-// In the hosted service — consume via constructor injection
 public class EventProcessingWorker : BackgroundService
 {
     private readonly IEventHubPullConsumer _consumer;
@@ -229,9 +298,9 @@ public class EventProcessingWorker : BackgroundService
         IMyProcessor processor,
         ILogger<EventProcessingWorker> logger)
     {
-        _consumer  = consumer;
+        _consumer = consumer;
         _processor = processor;
-        _logger    = logger;
+        _logger = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -240,157 +309,111 @@ public class EventProcessingWorker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            await FetchAndProcessAsync(stoppingToken);
-        }
-    }
+            FetchResult result = await _consumer.FetchAsync(maxPartitions: 3, stoppingToken);
 
-    private async Task FetchAndProcessAsync(CancellationToken stoppingToken)
-    {
-        // Fetch from up to 3 randomly selected partitions per cycle
-        // Use parameterless FetchAsync() to fetch from all owned partitions
-        FetchResult result = await _consumer.FetchAsync(maxPartitions: 3, stoppingToken);
-
-        if (!result.HasEvents)
-        {
-            // No events available on any owned partition right now
-            await Task.Delay(TimeSpan.FromMilliseconds(200), stoppingToken);
-            return;
-        }
-
-        await Task.WhenAll(result.Events.Values.Select(async fetchedEvent =>
-        {
-            // ── User does work here ──────────────────────────────────
-            await _processor.ProcessAsync(fetchedEvent.Data, stoppingToken);
-
-            // Only checkpoint after work is durably complete
-            bool checkpointed = await _consumer.UpdateCheckpointAsync(fetchedEvent, stoppingToken);
-
-            if (!checkpointed)
+            if (!result.HasEvents)
             {
-                // Partition was lost between fetch and checkpoint — event may
-                // be re-processed by another instance. Handle idempotency.
-                _logger.LogWarning("Lost partition {Id} before checkpoint", fetchedEvent.PartitionId);
+                await Task.Delay(TimeSpan.FromMilliseconds(200), stoppingToken);
+                continue;
             }
-        }));
+
+            await Task.WhenAll(result.Events.Values.Select(async fetchedEvent =>
+            {
+                await _processor.ProcessAsync(fetchedEvent.Data, stoppingToken);
+
+                bool checkpointed = await _consumer.UpdateCheckpointAsync(fetchedEvent, stoppingToken);
+                if (!checkpointed)
+                {
+                    _logger.LogWarning(
+                        "Checkpoint skipped for partition {PartitionId}; token was stale or checkpoint had already advanced.",
+                        fetchedEvent.PartitionId);
+                }
+            }));
+        }
     }
 }
-
-
 ```
 
 ---
 
-## Sequence Diagram: Fetch → Process → Checkpoint
+## Sequence Diagram: Fetch -> Process -> Checkpoint
 
+```text
+Caller                    Library                              Azure
+  |                          |                                   |
+  | StartAsync()             |                                   |
+  | -----------------------> | GetPartitionIds() -------------> Event Hubs
+  |                          | ClaimOwnership() --------------> Blob Storage
+  |                          | RestoreCheckpoints() ----------> Blob Storage
+  |                          | OpenReceivers() ---------------> Event Hubs
+  | <----------------------- |
+  |
+  | FetchAsync(maxPartitions?)                                  |
+  | -----------------------> | Select owned partitions          |
+  |                          | ReceiveBatchAsync() -----------> Event Hubs
+  | <----------------------- | FetchResult (no checkpoint)      |
+  |
+  | [caller processes event] |
+  |
+  | UpdateCheckpointAsync()  |
+  | -----------------------> | Validate ownership epoch         |
+  |                          | TryAdvanceCheckpoint() --------> Blob Storage
+  | <----------------------- | bool                             |
 ```
-Caller                    Library (IEventHubPullConsumer)           Azure
-  │                                │                                   │
-  │  StartAsync()                  │                                   │
-  │ ─────────────────────────────► │  GetPartitionIds()  ──────────► Event Hubs
-  │                                │  ClaimOwnership()   ──────────► Blob Storage (conditional PUT)
-  │                                │  RestoreCheckpoints()─────────► Blob Storage
-  │                                │  OpenAmqpReceivers()──────────► Event Hubs (AMQP)
-  │ ◄───────────────────────────── │
-  │
-  │  FetchAsync(maxPartitions?)      │
-  │ ─────────────────────────────► │
-  │                                │  Select partitions (all, or random k from owned set)
-  │                                │  ReceiveBatchAsync() (per selected partition, Task.WhenAll)
-  │                                │ ──────────────────────────────► AMQP prefetch buffer
-  │                                │ ◄──────────────────────────────
-  │ ◄── FetchResult ────────────── │  (checkpoint NOT written)
-  │
-  │  [caller does work on events]  │
-  │
-  │  UpdateCheckpointAsync(event)  │
-  │ ─────────────────────────────► │
-  │                                │  Verify still own partition (ownership check)
-  │                                │  SetMetadataAsync(offset, seqNo) ─► Blob Storage
-  │ ◄── bool (true/false) ──────── │
-```
-
----
-
-## Checkpoint Semantics: At-Least-Once
-
-The library enforces **at-least-once delivery** by design:
-
-```
-Timeline A — happy path:
-  FetchAsync() → [work] → UpdateCheckpointAsync() → ✅ processed exactly once
-
-Timeline B — crash before checkpoint:
-  FetchAsync() → [work] → CRASH
-  (next startup) → RestoreCheckpoint() → returns offset BEFORE this event
-  → FetchAsync() re-delivers the same event → caller must be idempotent
-
-Timeline C — ownership lost before checkpoint:
-  FetchAsync() → [work] → UpdateCheckpointAsync() → returns false (ownership gone)
-  Another instance has already taken this partition from its last checkpoint
-  → event will be re-processed by the other instance → caller must be idempotent
-```
-
-> **The caller is responsible for idempotency.** The library guarantees at-least-once; exactly-once requires idempotent processing logic in the caller.
 
 ---
 
 ## Internal Implementation Sketch
 
-```
+```text
 EventHubPullConsumer
-  │
-  ├── _partitionManager: PartitionOwnershipManager
-  │       ├── StartAsync()               — scan, claim ownership, restore
-  │       ├── RenewAllAsync()            — background timer, every 30s (conditional PUT)
-  │       ├── RebalanceAsync()           — runs within renewal cycle (steal/relinquish)
-  │       ├── IsOwned(partitionId)       — ownership health check before checkpoint
-  │       └── RelinquishAllAsync()       — graceful shutdown (clear OwnerIdentifier)
-  │
-  ├── _receivers: ConcurrentDictionary<string, PartitionReceiver>
-  │       — one PartitionReceiver (AMQP link) per owned partition
-  │       — added on acquire, removed on release/loss
-  │
-  ├── _checkpointStore: BlobCheckpointStore
-  │       ├── GetCheckpointAsync(partitionId)
-  │       └── UpdateCheckpointAsync(partitionId, offset, sequenceNumber)
-  │
-  ├── _fetchGuard: SemaphoreSlim(1, 1)
-  │       — serializes concurrent FetchAsync calls
-  │
-  └── FetchAsync(maxPartitions?)
-          → _fetchGuard.WaitAsync()
-          → partitions = maxPartitions == null
-              ? _receivers.Keys                                    // all owned
-              : _receivers.Keys.OrderBy(_ => Random.Shared.Next()) // random subset
-                               .Take(maxPartitions.Value)
-          → Task.WhenAll(partitions.Select(p => _receivers[p].ReceiveBatchAsync(1, FetchWaitTime)))
-          → build FetchResult (attach CheckpointToken per event, track QueriedPartitions)
-          → _fetchGuard.Release()
-
-  UpdateCheckpointAsync(fetchedEvent)
-          → _partitionManager.IsOwned(fetchedEvent.PartitionId)  → false: return false
-          → _checkpointStore.UpdateCheckpointAsync(...)           → write blob metadata
-          → return true
+  |
+  |-- _partitionManager: PartitionOwnershipManager
+  |     |-- StartAsync()              -- discover, claim, restore
+  |     |-- RenewAllAsync()           -- background renewal with If-Match on ownership ETag
+  |     |-- RebalanceAsync()          -- claim unowned / steal from overloaded owners
+  |     |-- TryGetOwnership(partitionId)
+  |     |-- RelinquishAllAsync()
+  |
+  |-- _receivers: ConcurrentDictionary<string, PartitionReceiver>
+  |     -- one long-lived receiver per owned partition
+  |
+  |-- _checkpointStore: BlobCheckpointStore
+  |     |-- GetCheckpointAsync(partitionId)
+  |     |-- TryAdvanceAsync(partitionId, token)
+  |
+  |-- _fetchGuard: SemaphoreSlim(1, 1)
+  |     -- serializes FetchAsync
+  |
+  |-- FetchAsync(maxPartitions?)
+  |     -- snapshot owned partitions
+  |     -- choose fair subset if maxPartitions is specified
+  |     -- Task.WhenAll(ReceiveBatchAsync(1, FetchWaitTime))
+  |     -- build FetchResult + embed ownership epoch into CheckpointToken
+  |
+  |-- UpdateCheckpointAsync(fetchedEvent)
+        -- validate token epoch against current ownership state
+        -- reject stale or non-monotonic checkpoint attempts
+        -- write checkpoint metadata only if the checkpoint advances
 ```
 
 ---
 
 ## `CheckpointToken` (Internal)
 
-The `FetchedEvent.CheckpointToken` is an internal type that carries everything the library needs to write the checkpoint, without exposing blob storage details to the caller:
+The checkpoint token is intentionally opaque to callers.
 
 ```csharp
 internal sealed class CheckpointToken
 {
-    internal string PartitionId     { get; }
-    internal string Offset          { get; }
-    internal long   SequenceNumber  { get; }
-    // No BlobClient reference — the store is resolved at checkpoint time
-    // via the library's own BlobCheckpointStore, not from this token
+    internal string PartitionId { get; }
+    internal string Offset { get; }
+    internal long SequenceNumber { get; }
+    internal string OwnershipEpoch { get; }
 }
 ```
 
-This keeps `FetchedEvent` a simple, serializable, dependency-free DTO.
+`OwnershipEpoch` changes each time a partition changes owners. That gives the library a cheap way to reject checkpoint attempts from a prior ownership incarnation of the same partition.
 
 ---
 
@@ -399,56 +422,38 @@ This keeps `FetchedEvent` a simple, serializable, dependency-free DTO.
 ```csharp
 public sealed class EventHubPullConsumerOptions
 {
-    // ── Event Hub ──────────────────────────────────────────────────────
-    public string            FullyQualifiedNamespace   { get; set; }  // "<ns>.servicebus.windows.net"
-    public string            EventHubName              { get; set; }
-    public string            ConsumerGroup             { get; set; } = "$Default";
-    public TokenCredential   Credential                { get; set; }  // DefaultAzureCredential recommended
+    // Event Hub
+    public string FullyQualifiedNamespace { get; set; }   // "<ns>.servicebus.windows.net"
+    public string EventHubName            { get; set; }
+    public string ConsumerGroup           { get; set; } = "$Default";
+    public TokenCredential Credential     { get; set; }   // DefaultAzureCredential recommended
 
-    // ── Blob Storage ───────────────────────────────────────────────────
-    public string            BlobConnectionString      { get; set; }
-    public string            BlobContainerName         { get; set; } = "eventhub-pullmode";
+    // Blob Storage
+    public string BlobConnectionString    { get; set; }
+    public string BlobContainerName       { get; set; } = "eventhub-pullmode";
 
-    // ── Ownership management ────────────────────────────────────────
-    public TimeSpan          OwnershipExpirationInterval { get; set; } = TimeSpan.FromMinutes(2);
-    public TimeSpan          LoadBalancingUpdateInterval { get; set; } = TimeSpan.FromSeconds(30);
-    public LoadBalancingStrategy LoadBalancingStrategy    { get; set; } = LoadBalancingStrategy.Greedy;
+    // Ownership management
+    public TimeSpan OwnershipExpirationInterval { get; set; } = TimeSpan.FromMinutes(2);
+    public TimeSpan LoadBalancingUpdateInterval { get; set; } = TimeSpan.FromSeconds(30);
+    public LoadBalancingStrategy LoadBalancingStrategy { get; set; } = LoadBalancingStrategy.Greedy;
 
-    // ── Fetch behaviour ────────────────────────────────────────────────
-    public int               MaxEventsPerFetch         { get; set; } = 1;
-    public TimeSpan          FetchWaitTime             { get; set; } = TimeSpan.FromMilliseconds(500);
-    public int               PrefetchCount             { get; set; } = 1;
-    public TimeSpan          IdleDelay                 { get; set; } = TimeSpan.FromMilliseconds(200);
+    // Fetch behavior
+    public TimeSpan FetchWaitTime         { get; set; } = TimeSpan.FromMilliseconds(500);
+    public int PrefetchCount              { get; set; } = 1;
 
-    // ── Startup ────────────────────────────────────────────────────────
-    public EventPosition     DefaultStartingPosition   { get; set; } = EventPosition.Earliest;
-    public string            InstanceId                { get; set; } = $"{Environment.MachineName}-{Guid.NewGuid():N}";
+    // Startup
+    public EventPosition DefaultStartingPosition { get; set; } = EventPosition.Earliest;
+    public string InstanceId              { get; set; } = $"{Environment.MachineName}-{Guid.NewGuid():N}";
 }
 ```
 
----
-
-## Dependency Injection Registration
-
-The registration shown in the usage pattern above binds options from configuration. For inline options or custom credential setup:
-
-```csharp
-// Inline options (no IConfiguration binding)
-services.AddSingleton<IEventHubPullConsumer>(_ =>
-    new EventHubPullConsumer(new EventHubPullConsumerOptions
-    {
-        FullyQualifiedNamespace = "myns.servicebus.windows.net",
-        EventHubName            = "my-hub",
-        Credential              = new DefaultAzureCredential(),
-        BlobConnectionString    = "DefaultEndpointsProtocol=https;...",
-        BlobContainerName       = "eventhub-pullmode"
-    }));
-```
-
-The `BackgroundService` pattern shown in the usage pattern above is the recommended hosting approach. The host manages the service lifetime — `DisposeAsync` on `IEventHubPullConsumer` is called when the host shuts down, relinquishing all ownership gracefully.
+Notes:
+- `PrefetchCount` should stay low for pull-style semantics.
+- `MaxEventsPerFetch` is intentionally omitted from v1 because the public API returns at most one event per queried partition.
+- `IdleDelay` is caller policy and stays outside the library contract.
 
 ---
 
 ## Related Documents
 
-- [EventHub-PullMode-Internals.md](./EventHub-PullMode-Internals.md) — Internal architecture: AMQP, ETag-based ownership, rebalancing, checkpoint storage
+- [EventHub-PullMode-Internals.md](./EventHub-PullMode-Internals.md) — Implementation details: AMQP links, ownership renewal, rebalance, checkpoint persistence
