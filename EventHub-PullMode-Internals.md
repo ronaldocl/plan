@@ -14,7 +14,7 @@ Those concerns are implemented by the library described in [EventHub-PullMode-Li
 
 This design assumes:
 - explicit checkpointing,
-- serialized `FetchAsync`,
+- serialized `FetchAsync` (if multiple callers invoke it at once, one runs and the others wait),
 - at most one event per queried partition per fetch call, and
 - ETag-based partition ownership backed by Blob Storage.
 
@@ -134,6 +134,8 @@ For that reason:
 ### Why `FetchAsync` Is Serialized
 
 `PartitionReceiver` is not intended to be read concurrently for the same partition. The library therefore guards `FetchAsync` with a `SemaphoreSlim(1, 1)` and performs one batch receive per selected partition inside that critical section.
+
+In simple terms: only one `FetchAsync` call is actively draining receivers at a time.
 
 That keeps the caller contract simple:
 - concurrent fetch calls are allowed,
