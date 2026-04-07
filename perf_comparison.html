@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>QueuedRequests vs VirtualQueue – Performance Comparison</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh;
+      padding: 32px 24px 60px;
+    }
+
+    header {
+      max-width: 1200px;
+      margin: 0 auto 40px;
+    }
+    header h1 {
+      font-size: 1.9rem;
+      font-weight: 700;
+      color: #f8fafc;
+      margin-bottom: 8px;
+    }
+    header p { color: #94a3b8; font-size: 0.95rem; }
+
+    .meta-badges {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 14px;
+    }
+    .badge {
+      background: #1e2535;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 4px 12px;
+      font-size: 0.8rem;
+      color: #94a3b8;
+    }
+    .badge span { color: #7dd3fc; font-weight: 600; }
+
+    /* Legend */
+    .legend {
+      display: flex;
+      gap: 28px;
+      margin: 0 auto 30px;
+      max-width: 1200px;
+    }
+    .legend-item { display: flex; align-items: center; gap: 8px; font-size: 0.9rem; }
+    .legend-dot {
+      width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0;
+    }
+    .dot-qr  { background: #f97316; }
+    .dot-vq  { background: #38bdf8; }
+
+    /* Section label */
+    .section-title {
+      max-width: 1200px;
+      margin: 0 auto 16px;
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: #cbd5e1;
+      border-left: 3px solid #38bdf8;
+      padding-left: 10px;
+    }
+
+    /* Grid */
+    .grid {
+      display: grid;
+      gap: 24px;
+      max-width: 1200px;
+      margin: 0 auto 48px;
+    }
+    .grid-2 { grid-template-columns: 1fr 1fr; }
+    .grid-1 { grid-template-columns: 1fr; }
+
+    @media (max-width: 800px) {
+      .grid-2 { grid-template-columns: 1fr; }
+    }
+
+    .card {
+      background: #1a2030;
+      border: 1px solid #263348;
+      border-radius: 12px;
+      padding: 20px 22px 16px;
+    }
+    .card h3 {
+      font-size: 0.88rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: #94a3b8;
+      margin-bottom: 14px;
+    }
+    .chart-wrap { position: relative; height: 280px; }
+    .chart-wrap-tall { position: relative; height: 320px; }
+
+    /* Summary table */
+    .summary-table {
+      max-width: 1200px;
+      margin: 0 auto 48px;
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+    }
+    thead tr { background: #1e2a3a; }
+    thead th {
+      text-align: center;
+      padding: 10px 14px;
+      color: #94a3b8;
+      font-weight: 600;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      font-size: 0.75rem;
+      border-bottom: 1px solid #263348;
+    }
+    thead th:first-child { text-align: left; }
+    tbody tr { border-bottom: 1px solid #1e2a3a; }
+    tbody tr:hover { background: #1e2535; }
+    tbody td {
+      padding: 9px 14px;
+      text-align: center;
+      color: #cbd5e1;
+    }
+    tbody td:first-child { text-align: left; font-weight: 600; color: #f1f5f9; }
+    .tag-qr {
+      display: inline-block;
+      background: rgba(249,115,22,.15);
+      color: #fb923c;
+      border: 1px solid rgba(249,115,22,.35);
+      border-radius: 4px;
+      padding: 1px 7px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      margin-left: 6px;
+    }
+    .tag-vq {
+      display: inline-block;
+      background: rgba(56,189,248,.12);
+      color: #38bdf8;
+      border: 1px solid rgba(56,189,248,.3);
+      border-radius: 4px;
+      padding: 1px 7px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      margin-left: 6px;
+    }
+    .better { color: #4ade80; font-weight: 700; }
+    .worse  { color: #f87171; }
+
+    /* Delta row helper */
+    .delta-positive { color: #4ade80; }
+    .delta-negative { color: #f87171; }
+
+    footer {
+      text-align: center;
+      color: #475569;
+      font-size: 0.8rem;
+      margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>QueuedRequests vs VirtualQueue — Performance Comparison</h1>
+  <p>Latency and RU/s cost as item count scales from 10K to 100K with 10% queued requests</p>
+  <div class="meta-badges">
+    <div class="badge">Platform: <span>Linux VM</span></div>
+    <div class="badge">CPU Cores: <span>4</span></div>
+    <div class="badge">Cosmos DB Feed Ranges: <span>8</span></div>
+    <div class="badge">Queue %: <span>10%</span></div>
+    <div class="badge">Requests/sec: <span>10</span></div>
+    <div class="badge">Duration: <span>10 s per run</span></div>
+  </div>
+</header>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot dot-qr"></div> QueuedRequests (baseline)</div>
+  <div class="legend-item"><div class="legend-dot dot-vq"></div> VirtualQueue (new approach)</div>
+</div>
+
+<!-- ──────────────────────────────── Section 1 ──────────────────────────────── -->
+<div class="section-title">Latency (Queue = 10%)</div>
+<div class="grid grid-2">
+
+  <div class="card">
+    <h3>Average Latency (ms)</h3>
+    <div class="chart-wrap">
+      <canvas id="avgLatChart"></canvas>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>P50 Latency (ms)</h3>
+    <div class="chart-wrap">
+      <canvas id="p50Chart"></canvas>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>P90 Latency (ms)</h3>
+    <div class="chart-wrap">
+      <canvas id="p90Chart"></canvas>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>P99 Latency (ms)</h3>
+    <div class="chart-wrap">
+      <canvas id="p99Chart"></canvas>
+    </div>
+  </div>
+
+</div>
+
+<!-- ──────────────────────────────── Section 2 ──────────────────────────────── -->
+<div class="section-title">RU per Feed Range per Request (Queue = 10%)</div>
+<div class="grid grid-2">
+
+  <div class="card">
+    <h3>Avg RU per Feed Range per Request — scaling comparison</h3>
+    <div class="chart-wrap">
+      <canvas id="rcuPerFrChart"></canvas>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>RU per Feed Range Δ (VQ − QR) — negative = VQ is cheaper</h3>
+    <div class="chart-wrap">
+      <canvas id="deltaRcuPerFrChart"></canvas>
+    </div>
+  </div>
+
+</div>
+
+<div class="section-title">QR: Per-Feed-Range RU Breakdown (feedRangeQueuedRequests, Queue = 10%)</div>
+<div class="grid grid-1">
+  <div class="card">
+    <h3>QueuedRequests — cumulative RU per individual feed range over test duration (all 8 FRs queried every request)</h3>
+    <div class="chart-wrap-tall">
+      <canvas id="qrPerFrBarChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- ──────────────────────────────── Section 3 ──────────────────────────────── -->
+<div class="section-title">Latency Improvement — VirtualQueue vs QueuedRequests (Queue = 10%)</div>
+<div class="grid grid-2">
+  <div class="card">
+    <h3>Avg Latency Δ (VQ − QR, ms) — negative = VQ is faster</h3>
+    <div class="chart-wrap">
+      <canvas id="deltaAvgChart"></canvas>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Total RU/s Δ (VQ − QR) — negative = VQ is cheaper</h3>
+    <div class="chart-wrap">
+      <canvas id="deltaRcuChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- ──────────────────────────────── Section 4 (Queue=0 baseline) ──────────────────────────────── -->
+<div class="section-title">No-Queue Baseline (Queue = 0%, Item Count = 60K)</div>
+<div class="grid grid-2">
+  <div class="card">
+    <h3>Avg Latency — Queue=0% vs Queue=10% (60K items)</h3>
+    <div class="chart-wrap">
+      <canvas id="noQueueLatChart"></canvas>
+    </div>
+  </div>
+  <div class="card">
+    <h3>RU per Feed Range per Request — Queue=0% vs Queue=10% (60K items)</h3>
+    <div class="chart-wrap">
+      <canvas id="noQueueRcuChart"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- ──────────────────────────────── Summary Table ──────────────────────────────── -->
+<div class="section-title">Summary Table (Queue = 10%)</div>
+<div class="summary-table">
+  <table>
+    <thead>
+      <tr>
+        <th>Item Count</th>
+        <th>Avg Lat QR (ms)</th>
+        <th>Avg Lat VQ (ms)</th>
+        <th>Δ Avg Lat</th>
+        <th>P50 QR</th>
+        <th>P50 VQ</th>
+        <th>P90 QR</th>
+        <th>P90 VQ</th>
+        <th>P99 QR</th>
+        <th>P99 VQ</th>
+        <th>RU/FR/req QR</th>
+        <th>RU/FR/req VQ</th>
+        <th>Δ RU/FR/req</th>
+        <th>VQ saving %</th>
+      </tr>
+    </thead>
+    <tbody id="summaryBody"></tbody>
+  </table>
+</div>
+
+<footer>Test environment: Linux VM · 4 CPU cores · Cosmos DB 8 feed ranges · Generated 2026-04-07</footer>
+
+<script>
+// ── Raw data ──────────────────────────────────────────────────────────────────
+const labels   = ['10K','20K','30K','40K','50K','60K','70K','80K','90K','100K'];
+const itemsRaw = [10000,20000,30000,40000,50000,60000,70000,80000,90000,100000];
+
+const qr_avg = [17.67,20.87,23.66,28.13,30.23,35.57,36.49,40.65,44.06,47.30];
+const vq_avg = [19.10,20.42,21.06,23.38,21.79,23.52,23.04,23.67,24.05,24.85];
+
+const qr_p50 = [14,18,21,25,28,32,36,38,43,44];
+const vq_p50 = [16,18,19,19,20,20,20,20,21,21];
+
+const qr_p90 = [33,28,30,35,40,48,45,47,53,60];
+const vq_p90 = [27,25,27,36,30,37,34,37,37,34];
+
+const qr_p99 = [44,69,64,86,66,65,50,79,92,82];
+const vq_p99 = [75,91,42,99,36,48,43,57,67,159];
+
+// Total RU/s (all 8 FRs combined) — kept for delta chart
+const qr_rcu = [485.9,734.7,974.0,1200.2,1442.9,1682.5,1920.8,2153.7,2388.1,2620.0];
+const vq_rcu = [612.8,625.8,709.9,661.3,706.0,763.7,817.4,887.4,948.9,1011.0];
+
+// ── RU per Feed Range per Request = avg(requestCharges) / 8 ──────────────────
+// Each requestCharge entry is the sum of RU across all 8 feed ranges for one query.
+// Dividing by 8 gives the cost attributable to a single feed range per request.
+const qr_rc_per_fr = [6.0200, 9.1013, 12.0816, 14.8990, 17.9025, 20.9088, 23.8575, 26.7413, 29.6727, 32.5751];
+const vq_rc_per_fr = [7.5954, 7.7597,  8.8037,  8.2012,  8.7526,  9.4795, 10.1416, 11.0011, 11.7836, 12.5375];
+
+// ── QR per-individual-FR cumulative RU (from feedRangeQueuedRequests) ─────────
+// These are the actual per-FR polling costs accumulated over the 10-second test.
+// QR scans all 8 feed ranges on every background poll cycle.
+const FR_LABELS = ['FR1\n[,07F…)', 'FR2\n[07F…,0FF)', 'FR3\n[0FF…,182)', 'FR4\n[182…,1FF)',
+                   'FR5\n[1FF…,27F)', 'FR6\n[27F…,2FF)', 'FR7\n[2FF…,37F)', 'FR8\n[37F…,FF)'];
+const FR_LABELS_SHORT = ['FR1','FR2','FR3','FR4','FR5','FR6','FR7','FR8'];
+
+// Each inner array = [FR1..FR8] cumulative RC for that item-count run
+const qr_per_fr_detail = {
+  '10K':  [6.72, 5.86, 5.79, 5.77, 6.30, 6.19, 5.79, 5.74],
+  '20K':  [9.88, 9.15, 9.04, 8.62, 9.20, 8.92, 9.22, 8.78],
+  '30K':  [12.89,12.05,12.61,10.98,11.89,12.30,12.33,11.61],
+  '40K':  [15.27,14.88,15.55,13.49,14.76,15.41,15.29,14.54],
+  '50K':  [18.05,17.88,18.42,16.62,17.81,18.91,17.79,17.74],
+  '60K':  [21.05,20.58,21.19,19.56,20.36,22.45,20.96,21.12],
+  '70K':  [24.41,23.22,24.27,22.31,23.69,25.27,23.89,23.80],
+  '80K':  [27.64,26.36,27.01,25.68,26.67,28.20,26.17,26.20],
+  '90K':  [30.55,29.29,30.06,28.55,29.46,31.15,29.10,29.22],
+  '100K': [33.30,31.97,32.78,31.50,32.39,34.34,31.92,32.37],
+};
+
+// ── Colours ──────────────────────────────────────────────────────────────────
+const C_QR      = '#f97316';
+const C_QR_FILL = 'rgba(249,115,22,0.15)';
+const C_VQ      = '#38bdf8';
+const C_VQ_FILL = 'rgba(56,189,248,0.12)';
+
+const FR_PALETTE = [
+  '#38bdf8','#818cf8','#a78bfa','#34d399','#fbbf24','#f87171','#fb923c','#e879f9'
+];
+const FR_PALETTE_FILL = FR_PALETTE.map(c => c + '33');
+
+// ── Chart defaults ────────────────────────────────────────────────────────────
+Chart.defaults.color = '#94a3b8';
+Chart.defaults.borderColor = '#263348';
+Chart.defaults.font.family = "'Segoe UI', system-ui, sans-serif";
+
+function baseOpts(yLabel, min0 = true) {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      legend: { labels: { color: '#94a3b8', boxWidth: 12, padding: 14 } },
+      tooltip: {
+        backgroundColor: '#1e2a3a',
+        borderColor: '#334155',
+        borderWidth: 1,
+        titleColor: '#f1f5f9',
+        bodyColor: '#cbd5e1',
+      }
+    },
+    scales: {
+      x: {
+        grid: { color: '#1e2a3a' },
+        ticks: { color: '#64748b' },
+      },
+      y: {
+        beginAtZero: min0,
+        grid: { color: '#1e2a3a' },
+        ticks: { color: '#64748b' },
+        title: { display: !!yLabel, text: yLabel, color: '#64748b', font: { size: 11 } },
+      }
+    }
+  };
+}
+
+function lineDS(label, data, color, fill) {
+  return {
+    label, data,
+    borderColor: color,
+    backgroundColor: fill,
+    pointBackgroundColor: color,
+    pointRadius: 4,
+    pointHoverRadius: 6,
+    borderWidth: 2.5,
+    tension: 0.3,
+    fill: false,
+  };
+}
+
+// ── Charts ────────────────────────────────────────────────────────────────────
+
+// 1. Average Latency
+new Chart(document.getElementById('avgLatChart'), {
+  type: 'line',
+  data: { labels, datasets: [lineDS('QueuedRequests', qr_avg, C_QR, C_QR_FILL), lineDS('VirtualQueue', vq_avg, C_VQ, C_VQ_FILL)] },
+  options: baseOpts('ms'),
+});
+
+// 2. P50
+new Chart(document.getElementById('p50Chart'), {
+  type: 'line',
+  data: { labels, datasets: [lineDS('QueuedRequests', qr_p50, C_QR, C_QR_FILL), lineDS('VirtualQueue', vq_p50, C_VQ, C_VQ_FILL)] },
+  options: baseOpts('ms'),
+});
+
+// 3. P90
+new Chart(document.getElementById('p90Chart'), {
+  type: 'line',
+  data: { labels, datasets: [lineDS('QueuedRequests', qr_p90, C_QR, C_QR_FILL), lineDS('VirtualQueue', vq_p90, C_VQ, C_VQ_FILL)] },
+  options: baseOpts('ms'),
+});
+
+// 4. P99
+new Chart(document.getElementById('p99Chart'), {
+  type: 'line',
+  data: { labels, datasets: [lineDS('QueuedRequests', qr_p99, C_QR, C_QR_FILL), lineDS('VirtualQueue', vq_p99, C_VQ, C_VQ_FILL)] },
+  options: baseOpts('ms'),
+});
+
+// 5. RU per Feed Range per Request — line comparison
+new Chart(document.getElementById('rcuPerFrChart'), {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [
+      lineDS('QueuedRequests (all 8 FRs hit)', qr_rc_per_fr, C_QR, C_QR_FILL),
+      lineDS('VirtualQueue (targeted FRs)', vq_rc_per_fr, C_VQ, C_VQ_FILL),
+    ]
+  },
+  options: {
+    ...baseOpts('RU / FR / request'),
+    plugins: {
+      ...baseOpts().plugins,
+      tooltip: {
+        ...baseOpts().plugins.tooltip,
+        callbacks: {
+          afterBody: (items) => {
+            const i = items[0].dataIndex;
+            const qr = qr_rc_per_fr[i], vq = vq_rc_per_fr[i];
+            const saving = (((qr - vq) / qr) * 100).toFixed(1);
+            return [`VQ saves ${saving}% per FR`];
+          }
+        }
+      }
+    }
+  },
+});
+
+// 6. Delta RU per FR per request (bar)
+const deltaRcuPerFr = vq_rc_per_fr.map((v, i) => +(v - qr_rc_per_fr[i]).toFixed(4));
+new Chart(document.getElementById('deltaRcuPerFrChart'), {
+  type: 'bar',
+  data: {
+    labels,
+    datasets: [{
+      label: 'VQ − QR (RU/FR/req)',
+      data: deltaRcuPerFr,
+      backgroundColor: deltaRcuPerFr.map(v => v < 0 ? 'rgba(74,222,128,.25)' : 'rgba(248,113,113,.25)'),
+      borderColor:     deltaRcuPerFr.map(v => v < 0 ? '#4ade80' : '#f87171'),
+      borderWidth: 1.5,
+      borderRadius: 4,
+    }]
+  },
+  options: {
+    ...baseOpts('RU/FR/req', false),
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        ...baseOpts().plugins.tooltip,
+        callbacks: {
+          afterBody: (items) => {
+            const i = items[0].dataIndex;
+            const qr = qr_rc_per_fr[i], vq = vq_rc_per_fr[i];
+            const saving = (((qr - vq) / qr) * 100).toFixed(1);
+            return [vq < qr ? `VQ saves ${saving}% per FR` : `VQ costs ${Math.abs(saving)}% more per FR`];
+          }
+        }
+      }
+    }
+  },
+});
+
+// 7. QR per-individual-FR grouped bar (cumulative RC per FR over test duration)
+{
+  const datasets = FR_LABELS_SHORT.map((frLabel, fi) => ({
+    label: frLabel,
+    data: labels.map(lbl => qr_per_fr_detail[lbl][fi]),
+    backgroundColor: FR_PALETTE_FILL[fi],
+    borderColor: FR_PALETTE[fi],
+    borderWidth: 1.5,
+    borderRadius: 3,
+  }));
+  new Chart(document.getElementById('qrPerFrBarChart'), {
+    type: 'bar',
+    data: { labels, datasets },
+    options: {
+      ...baseOpts('Cumulative RU (10 s test)'),
+      plugins: {
+        legend: { labels: { color: '#94a3b8', boxWidth: 10, padding: 10, font: { size: 11 } } },
+        tooltip: baseOpts().plugins.tooltip,
+      },
+      scales: {
+        ...baseOpts().scales,
+        x: { ...baseOpts().scales.x, stacked: false },
+        y: { ...baseOpts().scales.y, stacked: false },
+      }
+    },
+  });
+}
+
+// 8. Delta Avg Latency (bar)
+const deltaAvg = vq_avg.map((v, i) => +(v - qr_avg[i]).toFixed(2));
+new Chart(document.getElementById('deltaAvgChart'), {
+  type: 'bar',
+  data: {
+    labels,
+    datasets: [{
+      label: 'VQ − QR (ms)',
+      data: deltaAvg,
+      backgroundColor: deltaAvg.map(v => v < 0 ? 'rgba(74,222,128,.25)' : 'rgba(248,113,113,.25)'),
+      borderColor:     deltaAvg.map(v => v < 0 ? '#4ade80' : '#f87171'),
+      borderWidth: 1.5,
+      borderRadius: 4,
+    }]
+  },
+  options: {
+    ...baseOpts('ms', false),
+    plugins: { legend: { display: false }, tooltip: baseOpts().plugins.tooltip },
+  },
+});
+
+// 9. Delta total RCU/s
+const deltaRcu = vq_rcu.map((v, i) => +(v - qr_rcu[i]).toFixed(1));
+new Chart(document.getElementById('deltaRcuChart'), {
+  type: 'bar',
+  data: {
+    labels,
+    datasets: [{
+      label: 'VQ − QR (RU/s)',
+      data: deltaRcu,
+      backgroundColor: deltaRcu.map(v => v < 0 ? 'rgba(74,222,128,.25)' : 'rgba(248,113,113,.25)'),
+      borderColor:     deltaRcu.map(v => v < 0 ? '#4ade80' : '#f87171'),
+      borderWidth: 1.5,
+      borderRadius: 4,
+    }]
+  },
+  options: {
+    ...baseOpts('RU/s', false),
+    plugins: { legend: { display: false }, tooltip: baseOpts().plugins.tooltip },
+  },
+});
+
+// 10. No-Queue Baseline — grouped bars
+const noQueueLabels = ['QR Q=0%', 'VQ Q=0%', 'QR Q=10%', 'VQ Q=10%'];
+new Chart(document.getElementById('noQueueLatChart'), {
+  type: 'bar',
+  data: {
+    labels: noQueueLabels,
+    datasets: [{
+      label: 'Avg Latency (ms)',
+      data: [13.83, 14.82, 35.57, 23.52],
+      backgroundColor: [C_QR_FILL, C_VQ_FILL, C_QR_FILL, C_VQ_FILL],
+      borderColor:     [C_QR, C_VQ, C_QR, C_VQ],
+      borderWidth: 1.5,
+      borderRadius: 4,
+    }]
+  },
+  options: {
+    ...baseOpts('ms'),
+    plugins: { legend: { display: false }, tooltip: baseOpts().plugins.tooltip },
+  },
+});
+
+new Chart(document.getElementById('noQueueRcuChart'), {
+  type: 'bar',
+  data: {
+    labels: noQueueLabels,
+    datasets: [{
+      label: 'RU per FR per request',
+      // Q=0%: 3.09/3.09  Q=10% 60K: 20.91/9.48
+      data: [3.09, 3.09, 20.91, 9.48],
+      backgroundColor: [C_QR_FILL, C_VQ_FILL, C_QR_FILL, C_VQ_FILL],
+      borderColor:     [C_QR, C_VQ, C_QR, C_VQ],
+      borderWidth: 1.5,
+      borderRadius: 4,
+    }]
+  },
+  options: {
+    ...baseOpts('RU / FR / request'),
+    plugins: { legend: { display: false }, tooltip: baseOpts().plugins.tooltip },
+  },
+});
+
+// ── Summary Table ─────────────────────────────────────────────────────────────
+const tbody = document.getElementById('summaryBody');
+labels.forEach((lbl, i) => {
+  const dAvg = (vq_avg[i] - qr_avg[i]).toFixed(2);
+  const dFr  = (vq_rc_per_fr[i] - qr_rc_per_fr[i]).toFixed(4);
+  const savePct = (((qr_rc_per_fr[i] - vq_rc_per_fr[i]) / qr_rc_per_fr[i]) * 100).toFixed(1);
+  const dAvgCls = dAvg < 0 ? 'delta-positive' : 'delta-negative';
+  const dFrCls  = dFr  < 0 ? 'delta-positive' : 'delta-negative';
+  const saveCls = savePct > 0 ? 'delta-positive' : 'delta-negative';
+  tbody.insertAdjacentHTML('beforeend', `
+    <tr>
+      <td>${lbl}</td>
+      <td>${qr_avg[i]}</td>
+      <td>${vq_avg[i]}</td>
+      <td class="${dAvgCls}">${dAvg > 0 ? '+' : ''}${dAvg}</td>
+      <td>${qr_p50[i]}</td>
+      <td>${vq_p50[i]}</td>
+      <td>${qr_p90[i]}</td>
+      <td>${vq_p90[i]}</td>
+      <td>${qr_p99[i]}</td>
+      <td>${vq_p99[i]}</td>
+      <td>${qr_rc_per_fr[i].toFixed(4)}</td>
+      <td>${vq_rc_per_fr[i].toFixed(4)}</td>
+      <td class="${dFrCls}">${dFr > 0 ? '+' : ''}${dFr}</td>
+      <td class="${saveCls}">${savePct}%</td>
+    </tr>
+  `);
+});
+</script>
+</body>
+</html>
