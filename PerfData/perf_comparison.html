@@ -242,15 +242,6 @@
 
 </div>
 
-<div class="section-title">QR: Per-Feed-Range RU Breakdown (feedRangeQueuedRequests, Queue = 10%)</div>
-<div class="grid grid-1">
-  <div class="card">
-    <h3>QueuedRequests — cumulative RU per individual feed range over test duration (all 8 FRs queried every request)</h3>
-    <div class="chart-wrap-tall">
-      <canvas id="qrPerFrBarChart"></canvas>
-    </div>
-  </div>
-</div>
 
 <!-- ──────────────────────────────── Section 3 ──────────────────────────────── -->
 <div class="section-title">Latency Improvement — VirtualQueue vs QueuedRequests (Queue = 10%)</div>
@@ -514,34 +505,6 @@ new Chart(document.getElementById('deltaRcuPerFrChart'), {
     }
   },
 });
-
-// 7. QR per-individual-FR grouped bar (cumulative RC per FR over test duration)
-{
-  const datasets = FR_LABELS_SHORT.map((frLabel, fi) => ({
-    label: frLabel,
-    data: labels.map(lbl => qr_per_fr_detail[lbl][fi]),
-    backgroundColor: FR_PALETTE_FILL[fi],
-    borderColor: FR_PALETTE[fi],
-    borderWidth: 1.5,
-    borderRadius: 3,
-  }));
-  new Chart(document.getElementById('qrPerFrBarChart'), {
-    type: 'bar',
-    data: { labels, datasets },
-    options: {
-      ...baseOpts('Cumulative RU (10 s test)'),
-      plugins: {
-        legend: { labels: { color: '#94a3b8', boxWidth: 10, padding: 10, font: { size: 11 } } },
-        tooltip: baseOpts().plugins.tooltip,
-      },
-      scales: {
-        ...baseOpts().scales,
-        x: { ...baseOpts().scales.x, stacked: false },
-        y: { ...baseOpts().scales.y, stacked: false },
-      }
-    },
-  });
-}
 
 // 8. Delta Avg Latency (bar)
 const deltaAvg = vq_avg.map((v, i) => +(v - qr_avg[i]).toFixed(2));
