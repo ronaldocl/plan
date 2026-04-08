@@ -1,3 +1,5 @@
+- Use branch lcao/mr_container_migration_3 in d:\Code\picasso as the baseline.
+
 # Model Routing: Actual Queue to Virtual Queue Migration
 
 ## 1. Summary
@@ -9,7 +11,7 @@ The virtual queue model replaces this with server-side aggregation: Cosmos DB re
 This is an end-to-end change spanning four system boundaries:
 
 1. **Storage** — new `GetVirtualQueueByFeedRangesAsync` on `IModelRoutingStorageProvider`
-2. **Aggregator** — new `GetAggregationsV2Async` method returning `ModelRoutingAggregationsV2`
+2. **Aggregator** — `EnableVirtualQueueQuery` flag gates virtual queue fetch in `ProcessAggregationsCoreAsync`; new `GetAggregatedViewV2` serves cached V2 data
 3. **gRPC API** — new endpoint serving virtual queue aggregations
 4. **Router** — new `ModelRouterV2` using `RemoteVirtualQueues` with time-based interpolation
 
@@ -81,8 +83,8 @@ GROUP BY r.scenarioId, r.priority
 
 Each `VirtualQueue(ScenarioId, Priority, QueuedCount, FirstCreatedAt, LastCreatedAt)` summarizes one `(scenarioId, priority)` group. The router estimates queue position via time-based interpolation rather than exact counting:
 
-- If `createdAt >= LastCreatedAt` → 0 requests ahead (newest)
-- If `createdAt < FirstCreatedAt` → all requests ahead (oldest)
+- If `createdAt >= LastCreatedAt` → all requests ahead (newest)
+- If `createdAt <= FirstCreatedAt` → 0 requests ahead (oldest)
 - Otherwise → interpolate assuming uniform distribution over `[FirstCreatedAt, LastCreatedAt]`
 
 This trades exact position for O(groups) data transfer and computation. In practice the number of groups is small (number of scenarios × number of priority levels) and bounded by configuration, while the number of documents is unbounded.
@@ -121,11 +123,11 @@ QR cost scales linearly with document count; VQ cost scales with the number of d
 
 1. **New storage method** — `GetVirtualQueueByFeedRangesAsync` on `IModelRoutingStorageProvider`.
 2. **New data model** — `VirtualQueue` record and `ModelRoutingAggregationsV2` carrying virtual queues instead of per-document queued requests.
-3. **Aggregator V2 path** — new method on `IModelRoutingAggregator` returning `ModelRoutingAggregationsV2`.
+3. **Aggregator V2 path** — `EnableVirtualQueueQuery` flag in `ProcessAggregationsCoreAsync` gates virtual queue fetch; new `GetAggregatedViewV2` on `IModelRoutingAggregator` serves cached V2 data.
 4. **gRPC V2 endpoint** — new RPC serving virtual queue aggregations to router instances.
 5. **Router V2** — `ModelRouterV2` consuming `RemoteVirtualQueues` with time-based interpolation for queue position.
 6. **State model update** — `IModelRoutingState` gains `RemoteVirtualQueues` and `SyncRemoteState(ModelRoutingAggregationsV2)`.
-7. **Runtime switch** — V1/V2 coexistence via configuration flag, enabling incremental rollout and instant rollback.
+7. **Runtime switch** — Two feature flags (`EnableVirtualQueueQuery`, `UseVirtualQueue`) for incremental rollout and instant rollback via Azure App Configuration.
 
 ---
 
@@ -231,29 +233,72 @@ internal static VirtualQueue ToInternal(this External.VirtualQueue virtualQueue)
 
 ### 4.3 Aggregator
 
-**`IModelRoutingAggregator` — add method:**
+Add `EnableVirtualQueueQuery` check inside the existing `ProcessAggregationsCoreAsync`. When the flag is true, the aggregator additionally fetches virtual queue data from Cosmos DB and stores it in `cachedAggregationsV2`. The original aggregation path is unchanged.
+
+**`IModelRoutingAggregator` — add V2 method:**
 
 ```csharp
-Task<ModelRoutingAggregationsV2> GetAggregationsV2Async(CancellationToken cancellationToken);
+internal interface IModelRoutingAggregator
+{
+    ModelRoutingAggregations GetAggregatedView(string instanceId);        // existing
+    ModelRoutingAggregationsV2 GetAggregatedViewV2();                     // new
+    Task ProcessAggregationsAsync(CancellationToken cancellationToken);   // existing
+}
 ```
 
-This coexists with the existing `GetAggregatedView(instanceId)`. The V1 path remains for rollback.
-
-**`ModelRoutingAggregator` — add implementation:**
+**Add `IOptionsMonitor<ModelRoutingOptions>` to constructor and `GetAggregatedViewV2Core`:**
 
 ```csharp
-public async Task<ModelRoutingAggregationsV2> GetAggregationsV2Async(CancellationToken cancellationToken)
+internal sealed partial class ModelRoutingAggregator(
+    ILogger<ModelRoutingAggregator> logger,
+    Metrics metrics,
+    IModelRoutingStorageProvider modelRoutingStorageProvider,
+    IOptionsMonitor<ModelRoutingOptions> options)   // new
+    : IModelRoutingAggregator
 {
-    var getVirtualQueueTask = GetVirtualQueuesAsync(cancellationToken);
-    var getUsageTask = GetUsageAsync(cancellationToken);
+    private volatile ModelRoutingAggregationsCache cachedAggregations = new([], [], []);
+    private volatile ModelRoutingAggregationsCacheV2 cachedAggregationsV2 = new([], [], []);  // new
 
-    var virtualQueues = await getVirtualQueueTask;
+    [Activity("ModelRouting.GetAggregatedViewV2", Owner.ModelRouting)]
+    private ModelRoutingAggregationsV2 GetAggregatedViewV2Core()
+    {
+        var cache = cachedAggregationsV2;
+        return new(cache.VirtualQueues, cache.ScenariosUsage, cache.EndpointsUsage);
+    }
+```
+
+**Update `ProcessAggregationsCoreAsync`:**
+
+```csharp
+[Activity("ModelRouting.ProcessAggregations", Owner.ModelRouting)]
+private async Task ProcessAggregationsCoreAsync(CancellationToken cancellationToken)
+{
+    var enableVirtualQueueQuery = options.CurrentValue.EnableVirtualQueueQuery;
+
+    var getQueuedRequestsTask = GetQueuedRequestsAsync(cancellationToken);
+    var getUsageTask = GetUsageAsync(cancellationToken);
+    var getVirtualQueuesTask = enableVirtualQueueQuery
+        ? GetVirtualQueuesAsync(cancellationToken)
+        : null;
+
+    var queuedRequests = await getQueuedRequestsTask;
     var (scenariosUsage, endpointsUsage) = await getUsageTask;
 
-    ReportAggregatorMetrics(scenariosUsage, endpointsUsage);
-    return new(virtualQueues, scenariosUsage, endpointsUsage);
-}
+    cachedAggregations = new(queuedRequests, scenariosUsage, endpointsUsage);
 
+    if (getVirtualQueuesTask is not null)
+    {
+        var virtualQueues = await getVirtualQueuesTask;
+        cachedAggregationsV2 = new(virtualQueues, scenariosUsage, endpointsUsage);
+    }
+
+    ReportAggregatorMetrics(scenariosUsage, endpointsUsage);
+}
+```
+
+**Add `GetVirtualQueuesAsync`:**
+
+```csharp
 private async Task<IReadOnlyList<VirtualQueue>> GetVirtualQueuesAsync(CancellationToken cancellationToken)
 {
     var virtualQueues = await modelRoutingStorageProvider.GetVirtualQueueByFeedRangesAsync(cancellationToken);
@@ -273,47 +318,59 @@ private async Task<IReadOnlyList<VirtualQueue>> GetVirtualQueuesAsync(Cancellati
 
 Note: feed-range queries return partial results per physical partition. The same `(scenarioId, priority)` group may appear in multiple feed ranges and must be merged — sum `QueuedCount`, min `FirstCreatedAt`, max `LastCreatedAt`.
 
-**Key difference from V1 aggregation:** `GetAggregationsV2Async` does **not** call `GetQueuedRequestsByFeedRangesAsync` or `BuildAggregatedQueuedRequests`. It replaces the entire queued-request fetch + in-memory aggregation pipeline with a single `GetVirtualQueueByFeedRangesAsync` call followed by feed-range merging.
+**Add `ModelRoutingAggregationsCacheV2`:**
+
+```csharp
+internal sealed record ModelRoutingAggregationsCacheV2(
+    IReadOnlyList<VirtualQueue> VirtualQueues,
+    IReadOnlyList<ScenarioUsage> ScenariosUsage,
+    IReadOnlyList<EndpointUsage> EndpointsUsage);
+```
+
+`ModelRoutingAggregationsCache` is unchanged. The V2 cache reuses the same `ScenariosUsage` and `EndpointsUsage` from each polling cycle but replaces the per-request queue data with aggregated `VirtualQueues`. When `EnableVirtualQueueQuery` is `false`, `cachedAggregationsV2` stays as empty arrays.
 
 ### 4.4 gRPC API
 
 **New RPC in `modelrouting.proto`:**
 
 ```protobuf
-message VirtualQueueEntry {
-    string scenario_id = 1;
-    int32 priority = 2;
-    int32 queued_count = 3;
-    google.protobuf.Timestamp first_created_at = 4;
-    google.protobuf.Timestamp last_created_at = 5;
+message VirtualQueue {
+  string scenarioId = 1;
+  int32 priority = 2;
+  int32 queuedCount = 3;
+  google.protobuf.Timestamp firstCreatedAt = 4;
+  google.protobuf.Timestamp lastCreatedAt = 5;
+}
+
+message GetModelRoutingAggregationsV2Request {
 }
 
 message GetModelRoutingAggregationsV2Response {
-    repeated VirtualQueueEntry virtual_queues = 1;
-    repeated ScenarioUsage scenarios_usage = 2;
-    repeated EndpointUsage endpoints_usage = 3;
+  repeated VirtualQueue virtualQueues = 1;
+  repeated ScenarioUsage scenariosUsage = 2;
+  repeated EndpointUsage endpointsUsage = 3;
 }
 
 service ModelRouting {
-    // Existing
-    rpc GetModelRoutingAggregations(GetModelRoutingAggregationsRequest) returns (GetModelRoutingAggregationsResponse);
-    // New
-    rpc GetModelRoutingAggregationsV2(GetModelRoutingAggregationsV2Request) returns (GetModelRoutingAggregationsV2Response);
+  // Existing
+  rpc GetModelRoutingAggregations (GetModelRoutingAggregationsRequest) returns (GetModelRoutingAggregationsResponse);
+  // New — no instanceId needed since virtual queues are instance-agnostic
+  rpc GetModelRoutingAggregationsV2 (GetModelRoutingAggregationsV2Request) returns (GetModelRoutingAggregationsV2Response);
 }
 ```
 
 **`ModelRoutingService` (gRPC server) — add handler:**
 
 ```csharp
-public override async Task<External.GetModelRoutingAggregationsV2Response> GetModelRoutingAggregationsV2(
+public override Task<External.GetModelRoutingAggregationsV2Response> GetModelRoutingAggregationsV2(
     External.GetModelRoutingAggregationsV2Request request, ServerCallContext context)
 {
-    var aggregations = await modelRoutingAggregator.GetAggregationsV2Async(context.CancellationToken);
-    return ToExternal(aggregations);
+    var aggregations = modelRoutingAggregator.GetAggregatedViewV2();
+    return Task.FromResult(ToExternal(aggregations));
 }
 ```
 
-Note: unlike the V1 `GetModelRoutingAggregations` which calls `GetAggregatedView(instanceId)` synchronously (reads from cache), the V2 endpoint calls `GetAggregationsV2Async` which queries Cosmos DB on demand. This is because the virtual queue data is compact enough to compute per-request without pre-caching, and avoids the staleness inherent in the polling cache.
+Same pattern as V1 — reads from the volatile `cachedAggregationsV2` snapshot populated by `ProcessAggregationsCoreAsync`.
 
 ### 4.5 Router — `ModelRouterV2`
 
@@ -321,11 +378,11 @@ Create `ModelRouterV2` as a new class implementing `IModelRouter` and `IRequestA
 
 **Why a new class instead of branching in `ModelRouter`:**
 
-- `ModelRouter` uses `IReadOnlyList<RemoteModelRoutingRequest>` (per-instance, ordered entries) throughout `GetQueuePosition`, `GetQueuedCount`, and `AllocateQueuedRequests`. The virtual queue model uses `IReadOnlyDictionary<(string ScenarioId, int Priority), VirtualQueue>` — a fundamentally different data structure and access pattern.
+- `ModelRouter` uses `IReadOnlyList<RemoteModelRoutingRequest>` (per-instance, ordered entries) throughout `GetQueuePosition`, `GetQueuedCount`, and `AllocateQueuedRequests`. The virtual queue model uses `FrozenDictionary<(string ScenarioId, int Priority), VirtualQueue>` — a fundamentally different data structure and access pattern.
 - Queue position estimation changes from exact counting to time-based interpolation — the algorithm itself is different, not just the data source.
 - `IModelRoutingState` requires different fields (`RemoteVirtualQueues` vs `RemoteModelRoutingRequests`) and a different sync method (`SyncRemoteState(ModelRoutingAggregationsV2)` vs `SyncWithRemoteState(ModelRoutingAggregations)`).
 - Branching every access point in a 730-line class with concurrent state management creates risk disproportionate to the transition period. A separate class keeps both paths clean and testable.
-- DI registration switches which implementation is bound to `IModelRouter` — clean cutover with no runtime branching.
+- `VersionedModelRouter` delegates at runtime based on the `UseVirtualQueue` flag, keeping both V1 and V2 implementations warm for instant rollback.
 
 **Queue position estimation — time-based interpolation:**
 
@@ -334,6 +391,7 @@ The core algorithmic change is in `GetRemoteNumberOfRequestsAhead`. Without indi
 ```csharp
 private int GetRemoteNumberOfRequestsAhead(string scenarioId, int priority, DateTimeOffset createdAt)
 {
+    // PriorityValues: pre-computed array of all priority int values, e.g. [0, 1, 2, 3, 4, 5, 6]
     // Count all remote requests with strictly higher priority (lower priority value)
     int remoteRequestsWithHigherPriority = 0;
     foreach (int p in PriorityValues)
@@ -348,16 +406,16 @@ private int GetRemoteNumberOfRequestsAhead(string scenarioId, int priority, Date
     if (!state.RemoteVirtualQueues.TryGetValue((scenarioId, priority), out var priorityQueue))
         return remoteRequestsWithHigherPriority;
 
-    // Interpolate within the same priority group assuming uniform distribution
+    // Interpolate within the same priority group assuming uniform distribution (FIFO — earlier requests served first)
     int requestsAheadAtSamePriority = createdAt switch
     {
-        _ when createdAt >= priorityQueue.LastCreatedAt => 0,
-        _ when createdAt < priorityQueue.FirstCreatedAt => priorityQueue.QueuedCount,
-        _ when createdAt == priorityQueue.FirstCreatedAt => priorityQueue.QueuedCount - 1,
+        _ when createdAt <= priorityQueue.FirstCreatedAt => 0,
+        _ when createdAt > priorityQueue.LastCreatedAt => priorityQueue.QueuedCount,
+        _ when createdAt == priorityQueue.LastCreatedAt => priorityQueue.QueuedCount - 1,
         _ => Math.Min(
             priorityQueue.QueuedCount - 1,
             (int)Math.Ceiling(
-                1.0 * (priorityQueue.LastCreatedAt - createdAt).Ticks
+                1.0 * (createdAt - priorityQueue.FirstCreatedAt).Ticks
                     / (priorityQueue.LastCreatedAt - priorityQueue.FirstCreatedAt).Ticks
                     * priorityQueue.QueuedCount))
     };
@@ -366,18 +424,22 @@ private int GetRemoteNumberOfRequestsAhead(string scenarioId, int priority, Date
 }
 ```
 
-The interpolation assumes FIFO ordering (earlier requests are ahead). The fraction `(LastCreatedAt - createdAt) / (LastCreatedAt - FirstCreatedAt)` estimates what proportion of queued requests were created before the current request. This is an approximation — it's exact when requests are uniformly distributed and degrades gracefully when they're not, because the queue position only needs to be correct enough to determine if capacity is available (a threshold check, not a ranking).
+The interpolation assumes FIFO ordering (earlier requests are ahead), matching V1's `GetQueuePosition` which counts remotes where `r.CreatedAt < createdAt`. The fraction `(createdAt - FirstCreatedAt) / (LastCreatedAt - FirstCreatedAt)` estimates what proportion of queued requests were created before the current request. This is an approximation — it's exact when requests are uniformly distributed and degrades gracefully when they're not, because the queue position only needs to be correct enough to determine if capacity is available (a threshold check, not a ranking).
 
 **Queue-full check:**
 
 ```csharp
-private int GetQueuedCount(string scenarioId)
+private int GetQueuedCount(string scenarioId, bool isBackfill)
 {
-    var localQueuedCount = state.GetQueuedRequestsForScenario(scenarioId).Count();
+    var localQueuedCount = state.GetQueuedRequestsForScenario(scenarioId)
+        .Count(r => isBackfill == (r.Priority == BackfillPriorityInt));
 
     var remoteQueuedCount = 0;
     foreach (int p in PriorityValues)
     {
+        if (isBackfill != (p == BackfillPriorityInt))
+            continue;
+
         if (state.RemoteVirtualQueues.TryGetValue((scenarioId, p), out var virtualQueue))
             remoteQueuedCount += virtualQueue.QueuedCount;
     }
@@ -416,24 +478,41 @@ public void SyncRemoteState(ModelRoutingAggregationsV2 aggregations)
 
     RemoteVirtualQueues = newRemoteVirtualQueues;
 
+    // Convert lists to dictionaries for O(1) lookup (matching V1's pattern)
+    var scenarioUsageLookup = aggregations.ScenariosUsage
+        .ToDictionary(s => s.ScenarioId, StringComparer.Ordinal);
+    var endpointUsageLookup = aggregations.EndpointsUsage
+        .ToDictionary(e => e.Endpoint, StringComparer.Ordinal);
+
     // Update scenario and endpoint usage (same as V1)
     ScenarioUsages = ScenarioUsages.Keys.ToFrozenDictionary(
         scenarioId => scenarioId,
-        scenarioId => aggregations.ScenariosUsage
-            .FirstOrDefault(s => s.ScenarioId == scenarioId, new(scenarioId, 0, 0)),
+        scenarioId => scenarioUsageLookup.GetValueOrDefault(scenarioId, new(scenarioId, 0, 0)),
         StringComparer.Ordinal);
 
     EndpointUsages = EndpointUsages.Keys.ToFrozenDictionary(
         endpoint => endpoint,
-        endpoint => aggregations.EndpointsUsage
-            .FirstOrDefault(e => e.Endpoint == endpoint, new(endpoint, 0)),
+        endpoint => endpointUsageLookup.GetValueOrDefault(endpoint, new(endpoint, 0)),
         StringComparer.Ordinal);
 }
 ```
 
 ### 4.7 `ModelRoutingAggregationsClient` Changes
 
-Add V2 client method that calls the new gRPC endpoint and returns `ModelRoutingAggregationsV2`:
+**`IModelRoutingAggregationsClient` — add V2 method:**
+
+```csharp
+internal interface IModelRoutingAggregationsClient
+{
+    Task<ModelRoutingAggregations> GetAggregatedStateAsync(PicassoId instanceId, CancellationToken cancellationToken);  // existing
+    Task<ModelRoutingAggregationsV2> GetAggregatedStateV2Async(CancellationToken cancellationToken);                    // new
+    Task<IEnumerable<ModelRoutingConfig>> GetModelRoutingConfigsAsync(CancellationToken cancellationToken);              // existing
+}
+```
+
+**Add V2 client implementation:**
+
+Note: `ModelRoutingAggregationsV2` in the inference namespace (`Picasso.Inference.ModelRouting`) uses `IReadOnlyList` fields — matching the aggregator-side pattern since virtual queues are already keyed by `(ScenarioId, Priority)` and the dictionary conversion happens in `IModelRoutingState.SyncRemoteState`.
 
 ```csharp
 public async Task<ModelRoutingAggregationsV2> GetAggregatedStateV2Async(CancellationToken cancellationToken)
@@ -444,31 +523,32 @@ public async Task<ModelRoutingAggregationsV2> GetAggregatedStateV2Async(Cancella
         cancellationToken: cancellationToken);
 
     var virtualQueues = aggregations.VirtualQueues.Select(ToInternalVirtualQueue).ToArray();
-    var scenariosUsage = aggregations.ScenariosUsage.ToDictionary(su => su.ScenarioId, ToInternal, StringComparer.Ordinal);
-    var endpointsUsage = aggregations.EndpointsUsage.ToDictionary(eu => eu.Endpoint, ToInternal, StringComparer.Ordinal);
+    var scenariosUsage = aggregations.ScenariosUsage.Select(ToInternal).ToArray();
+    var endpointsUsage = aggregations.EndpointsUsage.Select(ToInternal).ToArray();
 
-    return new(virtualQueues, scenariosUsage.Values.ToArray(), endpointsUsage.Values.ToArray());
+    return new(virtualQueues, scenariosUsage, endpointsUsage);
 }
 
-private static VirtualQueue ToInternalVirtualQueue(External.VirtualQueueEntry entry) =>
+private static VirtualQueue ToInternalVirtualQueue(Picasso.ModelRouting.Api.External.VirtualQueue entry) =>
     new(entry.ScenarioId, entry.Priority, entry.QueuedCount, entry.FirstCreatedAt.ToDateTimeOffset(), entry.LastCreatedAt.ToDateTimeOffset());
 ```
 
 ### 4.8 `ModelRoutingService` (BackgroundService) Changes
 
-The background service on each inference instance needs to call the V2 path when enabled:
+The background service on each inference instance syncs state through `IRequestAllocationManager` (resolved to `VersionedModelRouter`). When `UseVirtualQueue` is true, it syncs V2 data; otherwise V1. Change from `IOptions` to `IOptionsMonitor` to support runtime flag toggling without restart:
 
 ```csharp
 protected override async Task ExecuteAsync(CancellationToken stoppingToken)
 {
+    logger.Starting();
     do
     {
         try
         {
-            if (options.Value.UseVirtualQueue)
+            if (options.CurrentValue.UseVirtualQueue)
             {
-                var aggregations = await aggregationsClient.GetAggregatedStateV2Async(stoppingToken);
-                requestManager.ProcessAggregationsAndAllocateV2(aggregations);
+                var aggregationsV2 = await aggregationsClient.GetAggregatedStateV2Async(stoppingToken);
+                requestManager.ProcessAggregationsAndAllocateV2(aggregationsV2);
             }
             else
             {
@@ -485,37 +565,138 @@ protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         }
     }
     while (await processingTimer.WaitForNextTickAsync(stoppingToken));
+
+    logger.Stopping();
 }
 ```
 
 ### 4.9 Runtime Switch
 
-Add `UseVirtualQueue` to `ModelRoutingOptions`:
+Two feature flags control incremental rollout, each gated independently via Azure App Configuration (already supported by the Picasso repo). Toggling either flag takes effect within the refresh interval — no deployment or restart needed.
+
+Flags are split across options classes matching their consumers:
+
+**`ModelRoutingOptions`** (aggregator-side, `Picasso.ModelRouting`):
 
 ```csharp
 internal sealed record ModelRoutingOptions
 {
     // ... existing properties ...
 
-    // When true, the aggregator serves virtual queue data and routers use time-based interpolation.
-    // When false, the existing ectual queue model is used.
-    // Updatable at runtime via Azure App Configuration. Default: false.
+    // Stage 1: Aggregator fetches virtual queue data from Cosmos DB and holds it in memory.
+    //          The original aggregation path is unaffected.
+    public bool EnableVirtualQueueQuery { get; init; }
+}
+```
+
+**`ModelRoutingWithAuthOptions`** (inference-side, `Picasso.Inference.ModelRouting`):
+
+```csharp
+internal sealed record ModelRoutingWithAuthOptions
+{
+    // ... existing properties ...
+
+    // Stage 2: Router switches from V1 to V2 for acquire/release decisions.
     public bool UseVirtualQueue { get; init; }
 }
 ```
 
-**DI registration** switches the `IModelRouter` binding based on configuration:
+**Rollout order:**
+
+| Stage | Flag | Component | Effect | Risk |
+|-------|------|-----------|--------|------|
+| 1 | `EnableVirtualQueueQuery` | Aggregator | Queries virtual queue from Cosmos DB, stores in memory. V1 aggregation unchanged. | Low — read-only, no downstream impact |
+| 2 | `UseVirtualQueue` | Router | Switches `VersionedModelRouter` from V1 to V2. | Medium — changes routing decisions |
+
+Each stage can be enabled independently and rolled back by flipping the flag. Stage 2 depends on stage 1 being active (the aggregator must have virtual queue data for the V2 gRPC endpoint to serve), but stage 1 can run safely without stage 2. When `UseVirtualQueue` is true, the background service additionally syncs V2 data via gRPC.
+
+**DI registration** — `VersionedModelRouter` implements both `IModelRouter` and `IRequestAllocationManager`, replacing the direct `ModelRouter` registration for `IRequestAllocationManager`:
 
 ```csharp
-// Option A: Register both, use configuration to select at runtime
-// Option B: Conditional registration at startup
-if (options.UseVirtualQueue)
-    services.AddSingleton<IModelRouter, ModelRouterV2>();
-else
-    services.AddSingleton<IModelRouter, ModelRouter>();
+// Existing keyed registrations (already in AppStartup.cs)
+services
+    .AddKeyedSingleton<IModelRouter, ModelRouter>("ModelRouter")
+    .AddKeyedSingleton<IModelRouter, WeightedModelRouter>("WeightedModelRouter");
+
+// New: register ModelRouterV2 as keyed singleton
+services
+    .AddKeyedSingleton<IModelRouter, ModelRouterV2>("ModelRouterV2");
+
+// New: register VersionedModelRouter as both IModelRouter and IRequestAllocationManager
+// Replaces the existing: .AddSingleton<IRequestAllocationManager, ModelRouter>()
+services.AddSingleton<VersionedModelRouter>(sp =>
+{
+    var v1 = sp.GetRequiredKeyedService<IModelRouter>("ModelRouter");
+    var v2 = sp.GetRequiredKeyedService<IModelRouter>("ModelRouterV2");
+    var optionsMonitor = sp.GetRequiredService<IOptionsMonitor<ModelRoutingWithAuthOptions>>();
+    return new VersionedModelRouter(v1, v2, optionsMonitor);
+});
+services.AddSingleton<IModelRouter>(sp => sp.GetRequiredService<VersionedModelRouter>());
+services.AddSingleton<IRequestAllocationManager>(sp => sp.GetRequiredService<VersionedModelRouter>());
 ```
 
-Note: since `IModelRouter` is a singleton and the flag is read at startup, changing `UseVirtualQueue` requires a restart (unlike `UseV2Container` which was hot-swappable). This is acceptable because the router holds long-lived state and concurrent data structures that can't be safely swapped at runtime.
+**`ModelRoutingLeaseFactory` change** — update to resolve non-keyed `IModelRouter` so it routes through `VersionedModelRouter`:
+
+```csharp
+// Before: [FromKeyedServices("ModelRouter")] IModelRouter modelRouter
+// After:
+internal sealed partial class ModelRoutingLeaseFactory(
+    ...
+    IModelRouter modelRouter) : IModelRoutingLeaseFactory   // resolves to VersionedModelRouter
+```
+
+**`IRequestAllocationManager` — add V2 method:**
+
+```csharp
+internal interface IRequestAllocationManager
+{
+    PicassoId InstanceId { get; }
+    void ProcessAggregationsAndAllocate(ModelRoutingAggregations aggregations);       // existing
+    void ProcessAggregationsAndAllocateV2(ModelRoutingAggregationsV2 aggregations);   // new
+}
+```
+
+**`VersionedModelRouter`** — implements both `IModelRouter` and `IRequestAllocationManager`, delegating to V1 and V2 routers:
+
+```csharp
+/// <summary>
+/// Delegates to V1 or V2 router based on the live UseVirtualQueue flag.
+/// Implements IRequestAllocationManager to route both V1 and V2 sync calls
+/// to the correct underlying router.
+/// </summary>
+internal sealed class VersionedModelRouter(
+    IModelRouter v1,
+    IModelRouter v2,
+    IOptionsMonitor<ModelRoutingWithAuthOptions> optionsMonitor) : IModelRouter, IRequestAllocationManager
+{
+    private IModelRouter Current =>
+        optionsMonitor.CurrentValue.UseVirtualQueue ? v2 : v1;
+
+    // IModelRouter — delegates based on UseVirtualQueue flag
+    public Task<IAcquireResult> AcquireAsync(string scenarioId, InferencePriority priority, TimeSpan? acquireTimeout, CancellationToken cancellationToken) =>
+        Current.AcquireAsync(scenarioId, priority, acquireTimeout, cancellationToken);
+
+    public void Release(PicassoId requestId, ModelRoutingUnifiedStatusCode statusCode, TimeSpan duration) =>
+        Current.Release(requestId, statusCode, duration);
+
+    // IRequestAllocationManager — V1 sync always goes to V1 router, V2 sync always goes to V2 router
+    public PicassoId InstanceId => ((IRequestAllocationManager)v1).InstanceId;
+
+    public void ProcessAggregationsAndAllocate(ModelRoutingAggregations aggregations) =>
+        ((IRequestAllocationManager)v1).ProcessAggregationsAndAllocate(aggregations);
+
+    public void ProcessAggregationsAndAllocateV2(ModelRoutingAggregationsV2 aggregations) =>
+        ((IRequestAllocationManager)v2).ProcessAggregationsAndAllocateV2(aggregations);
+}
+```
+
+**Rollback strategy:** Roll back in reverse order by flipping flags in Azure App Configuration. Changes propagate within ≤ 35 seconds (30s refresh interval + up to 5s jitter) — no deployment, no restart.
+
+| Scenario | Action |
+|----------|--------|
+| V2 routing issues | Set `UseVirtualQueue = false` — reverts to V1 router and V1 sync immediately. Both routers stay warm in memory, no cold-start penalty. |
+| Virtual queue fetch issues (e.g., RU spike) | Set `EnableVirtualQueueQuery = false` — aggregator stops querying virtual queue from Cosmos DB. |
+| Full rollback | Set both flags to `false` — system returns to pure V1 behaviour. |
 
 ---
 
@@ -553,7 +734,7 @@ Key differences:
 |--------|----|----|
 | Cosmos query | `SELECT *` (all docs) | `GROUP BY` (aggregates) |
 | Data over gRPC | O(queued documents) | O(scenarios × priorities) |
-| Aggregator cache | All sorted documents | Not needed (computed per request) |
+| Aggregator cache | All sorted documents | Merged virtual queues in `cachedAggregationsV2` |
 | Per-instance view | Required (`BuildAggregatedQueuedRequests`) | Not needed (virtual queues are instance-agnostic) |
 | Queue position | Exact count | Time-based interpolation |
 | State structure | `IReadOnlyList<RemoteModelRoutingRequest>` per scenario | `VirtualQueue` per (scenario, priority) |
@@ -567,9 +748,11 @@ Key differences:
 | File | Description |
 |------|-------------|
 | `Shared/ModelRouting/VirtualQueue.cs` | `VirtualQueue` internal record |
-| `Shared/ModelRouting/Storage/External/VirtualQueue.cs` | `External.VirtualQueue` serialization record |
+| `Shared/ModelRouting/Storage/External/VirtualQueue.cs` | `External.VirtualQueue` Cosmos DB serialization record |
+| `Shared/ModelRouting/ModelRoutingAggregationsCacheV2.cs` | `ModelRoutingAggregationsCacheV2` record (or added to existing `ModelRoutingAggregations.cs`) |
 | `Shared/ModelRouting/ModelRoutingAggregationsV2.cs` | `ModelRoutingAggregationsV2` record (or added to existing `ModelRoutingAggregations.cs`) |
 | `Shared/Inference/ModelRouting/ModelRouterV2.cs` | V2 router with time-based interpolation |
+| `Shared/Inference/ModelRouting/VersionedModelRouter.cs` | Delegating router that switches V1/V2 based on `UseVirtualQueue` flag |
 
 ### Modified Files
 
@@ -579,18 +762,20 @@ Key differences:
 | `Shared/ModelRouting/Storage/ModelRoutingStorageProvider.cs` | Add query constant, `QueryDefinition`, and implementation |
 | `Shared/ModelRouting/Storage/Converters.cs` | Add `ToInternal` for `External.VirtualQueue` |
 | `Shared/ModelRouting/Storage/External/SerializationContext.cs` | Add `[JsonSerializable(typeof(External.VirtualQueue))]` |
-| `Service.ModelRouting/Aggregator/IModelRoutingAggregator.cs` | Add `GetAggregationsV2Async` |
-| `Service.ModelRouting/Aggregator/ModelRoutingAggregator.cs` | Add `GetAggregationsV2Async` and `GetVirtualQueuesAsync` |
+| `Service.ModelRouting/InternalContracts/IModelRoutingAggregator.cs` | Add `GetAggregatedViewV2` |
+| `Service.ModelRouting/Aggregator/ModelRoutingAggregator.cs` | Add `GetAggregatedViewV2Core`, `GetVirtualQueuesAsync`, `EnableVirtualQueueQuery` check in `ProcessAggregationsCoreAsync` |
 | `Service.ModelRouting/Api/Services/ModelRoutingService.cs` | Add `GetModelRoutingAggregationsV2` gRPC handler |
-| `Service.ModelRouting/Api/Protos/modelrouting.proto` | Add `VirtualQueueEntry` message and V2 RPC |
+| `Service.ModelRouting/Api/Proto/ModelRouting.proto` | Add `VirtualQueue` message, V2 request/response messages, and V2 RPC |
 | `Shared/Inference/ModelRouting/IModelRoutingState.cs` | Add `RemoteVirtualQueues` and `SyncRemoteState(ModelRoutingAggregationsV2)` |
 | `Shared/Inference/ModelRouting/ModelRoutingState.cs` | Implement `RemoteVirtualQueues` storage and `SyncRemoteState` |
-| `Shared/Inference/ModelRouting/IModelRoutingAggregationsClient.cs` | Add `GetAggregatedStateV2Async` |
-| `Shared/Inference/ModelRouting/ModelRoutingAggregationsClient.cs` | Add V2 client method |
+| `Shared/Inference/ModelRouting/IModelRoutingAggregationsClient.cs` | Add `GetAggregatedStateV2Async` and inference-side `ModelRoutingAggregationsV2` record |
+| `Shared/Inference/ModelRouting/ModelRoutingAggregationsClient.cs` | Add V2 client method and `ToInternalVirtualQueue` mapper |
 | `Shared/Inference/ModelRouting/IRequestAllocationManager.cs` | Add `ProcessAggregationsAndAllocateV2` |
-| `Shared/Inference/ModelRouting/ModelRoutingService.cs` | Branch on `UseVirtualQueue` in polling loop |
-| `Shared/ModelRouting/ModelRoutingOptions.cs` | Add `UseVirtualQueue` flag |
-| `Shared/Inference/AppStartup.cs` | Conditional DI registration for `IModelRouter` |
+| `Shared/Inference/ModelRouting/ModelRoutingService.cs` | Change `IOptions` to `IOptionsMonitor`, branch on `UseVirtualQueue` for V2 sync |
+| `Shared/ModelRouting/ModelRoutingOptions.cs` | Add `EnableVirtualQueueQuery` flag |
+| `Shared/Inference/ModelRouting/ModelRoutingWithAuthOptions.cs` | Add `UseVirtualQueue` flag |
+| `Shared/Inference/ModelRouting/ModelRoutingLeaseFactory.cs` | Change `[FromKeyedServices("ModelRouter")] IModelRouter` to non-keyed `IModelRouter` |
+| `Shared/Inference/AppStartup.cs` | Register `ModelRouterV2`, `VersionedModelRouter` as non-keyed `IModelRouter` |
 
 ---
 
@@ -598,34 +783,39 @@ Key differences:
 
 ### Phase 1 — Storage + Aggregator
 
-Add `GetVirtualQueueByFeedRangesAsync` to storage provider and `GetAggregationsV2Async` to aggregator. Add gRPC V2 endpoint. Deploy with `UseVirtualQueue = false`. No production behaviour change.
+Add `GetVirtualQueueByFeedRangesAsync` to storage provider. Add `EnableVirtualQueueQuery` flag and virtual queue fetch to `ProcessAggregationsCoreAsync`. Add `GetAggregatedViewV2` and `ModelRoutingAggregationsCacheV2`. Add gRPC V2 endpoint. Deploy with all flags `false`. No production behaviour change.
 
-### Phase 2 — Router V2
+### Phase 2 — Router V2 + Background Service
 
-Add `ModelRouterV2`, `IModelRoutingState` changes, and `ModelRoutingAggregationsClient` V2 path. Deploy with `UseVirtualQueue = false`. V2 code is present but inactive.
+Add `ModelRouterV2`, `VersionedModelRouter`, `IModelRoutingState` changes (`RemoteVirtualQueues`, `SyncRemoteState`), `ModelRoutingAggregationsClient` V2 path, and background service V2 sync path. Change `ModelRoutingLeaseFactory` to resolve non-keyed `IModelRouter`. Add `UseVirtualQueue` to `ModelRoutingWithAuthOptions`. Deploy with all flags `false`. V2 code is present but inactive — only V1 sync runs when `UseVirtualQueue` is false.
 
-### Phase 3 — Rollout
+### Phase 3 — Incremental Rollout
 
-Set `UseVirtualQueue = true` per environment. Requires restart (singleton DI binding).
+Enable flags one at a time per environment, validating each stage before proceeding to the next:
 
-**Sequence:**
-1. Staging — validate queue position accuracy, allocation behaviour, RU reduction
+| Step | Flag | What to validate |
+|------|------|-----------------|
+| 3a | `EnableVirtualQueueQuery = true` | Aggregator queries virtual queue from Cosmos DB successfully. Monitor RU consumption. V1 behaviour unchanged since `UseVirtualQueue` is still false. |
+| 3b | `UseVirtualQueue = true` | Router switches to V2. Validate queue position accuracy, allocation behaviour, RU reduction. |
+
+**Sequence per step:**
+1. Staging — validate behaviour and metrics
 2. Production
 
-**Rollback:** Set `UseVirtualQueue = false` and restart. V1 path remains fully functional.
+**Rollback:** Flip the problematic flag to `false` via Azure App Configuration. Takes effect within ≤ 35 seconds — no deployment, no restart. Roll back in reverse order if needed.
 
 ### Phase 4 — Cleanup
 
 After V2 is stable in all environments:
 
-1. Remove `ModelRouter` (V1) class
+1. Remove `ModelRouter` (V1) class and `VersionedModelRouter`
 2. Remove `GetQueuedRequestsByFeedRangesAsync` from `IModelRoutingStorageProvider` and implementation
 3. Remove `BuildAggregatedQueuedRequests` from aggregator
-4. Remove `GetAggregatedView(instanceId)` and V1 gRPC endpoint
+4. Remove `GetAggregatedView(instanceId)`, `ModelRoutingAggregationsCache`, and V1 gRPC endpoint
 5. Remove `RemoteModelRoutingRequests` from `IModelRoutingState`
 6. Remove `SyncWithRemoteState(ModelRoutingAggregations)` from state
-7. Remove `UseVirtualQueue` flag
-8. Rename `ModelRouterV2` → `ModelRouter`
+7. Remove `EnableVirtualQueueQuery` and `UseVirtualQueue` flags
+8. Rename `ModelRouterV2` → `ModelRouter`, `ModelRoutingAggregationsCacheV2` → `ModelRoutingAggregationsCache`
 
 ---
 
@@ -638,17 +828,25 @@ After V2 is stable in all environments:
 - `Converters.ToInternal(External.VirtualQueue)`: verify field mapping.
 
 **Aggregator:**
-- `ModelRoutingAggregator.GetAggregationsV2Async`: verify feed-range merging (sum counts, min/max timestamps for same group across feed ranges).
+- `ModelRoutingAggregator.GetVirtualQueuesAsync`: verify feed-range merging (sum counts, min/max timestamps for same group across feed ranges).
+- `GetAggregatedViewV2Core`: verify returns snapshot from `cachedAggregationsV2`.
+- `ProcessAggregationsCoreAsync` with `EnableVirtualQueueQuery = true`: verify `cachedAggregationsV2` is populated.
+- `ProcessAggregationsCoreAsync` with `EnableVirtualQueueQuery = false`: verify `cachedAggregationsV2` stays empty.
 
 **Router V2:**
 - `GetRemoteNumberOfRequestsAhead` interpolation:
-  - `createdAt` before `FirstCreatedAt` → returns full `QueuedCount`
-  - `createdAt` after `LastCreatedAt` → returns 0
+  - `createdAt` before `FirstCreatedAt` → returns 0 (oldest, first to be served)
+  - `createdAt` after `LastCreatedAt` → returns full `QueuedCount` (newest, everyone ahead)
   - `createdAt` at midpoint → returns ~half of `QueuedCount`
   - Single-element queue (`FirstCreatedAt == LastCreatedAt`) → returns `QueuedCount - 1`
-- `GetQueuedCount`: verify sums local + remote across all priorities.
+- `GetQueuedCount(scenarioId, isBackfill)`: verify sums local + remote with correct backfill filtering.
 - `AllocateQueuedRequests`: verify allocation order respects priority.
 - Existing `ModelRouter` V1 tests remain unchanged.
+
+**VersionedModelRouter:**
+- `UseVirtualQueue = true` → delegates to V2.
+- `UseVirtualQueue = false` → delegates to V1.
+- Runtime flag change → switches implementation on next call.
 
 ### Staging Validation
 
