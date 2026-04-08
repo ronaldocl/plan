@@ -545,7 +545,7 @@ private static VirtualQueue ToInternalVirtualQueue(Picasso.ModelRouting.Api.Exte
 
 ### 4.8 `ModelRoutingService` (BackgroundService) Changes
 
-The background service on each inference instance syncs state through `IRequestAllocationManager` (resolved to `VersionedModelRouter`). To support safe cutover, sync and allocation are split: the service always refreshes the V1 snapshot, optionally refreshes the V2 snapshot when `EnableVirtualQueueSync` is enabled, and runs allocation once through the currently selected router. Change from `IOptions` to `IOptionsMonitor` to support runtime flag toggling without restart:
+The background service on each inference instance syncs state through `IRequestAllocationManager` (resolved to `VersionedModelRouter`). To support safe cutover, sync and allocation are split: the service always refreshes the V1 snapshot, optionally refreshes the V2 snapshot when `EnableVirtualQueueSync` is enabled, and runs allocation once through the currently selected router. The V2 sync path is best-effort while `UseVirtualQueue` is `false`, so a V2 fetch failure must not suppress V1 allocation. Once `UseVirtualQueue` is `true`, the router continues using the last successful V2 snapshot if a later V2 fetch fails. Change from `IOptions` to `IOptionsMonitor` to support runtime flag toggling without restart:
 
 ```csharp
 protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -555,13 +555,28 @@ protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         try
         {
+            var useVirtualQueue = options.CurrentValue.UseVirtualQueue;
             var aggregations = await aggregationsClient.GetAggregatedStateAsync(requestManager.InstanceId, stoppingToken);
             requestManager.SyncAggregations(aggregations);
 
             if (options.CurrentValue.EnableVirtualQueueSync)
             {
-                var aggregationsV2 = await aggregationsClient.GetAggregatedStateV2Async(stoppingToken);
-                requestManager.SyncAggregationsV2(aggregationsV2);
+                try
+                {
+                    var aggregationsV2 = await aggregationsClient.GetAggregatedStateV2Async(stoppingToken);
+                    requestManager.SyncAggregationsV2(aggregationsV2);
+                }
+                catch (Exception ex) when (ex.IsNotCancelled())
+                {
+                    logger.FailedToSyncV2(ex);
+
+                    // Before V2 is live, V2 sync is best-effort and must not block V1 allocation.
+                    // After V2 is live, continue with the last successful V2 snapshot already in memory.
+                    if (useVirtualQueue)
+                    {
+                        // No-op: keep the last successful V2 snapshot.
+                    }
+                }
             }
 
             requestManager.AllocateQueuedRequests();
@@ -723,28 +738,30 @@ internal sealed class VersionedModelRouter(
 
 ### V1 (Actual Queue)
 
-```
-Cosmos DB ──SELECT *──→ StorageProvider ──all docs──→ Aggregator
-    ↓ caches sorted docs
-    ↓ per gRPC request: BuildAggregatedQueuedRequests(instanceId)
-    ↓
-gRPC ──RemoteModelRoutingRequest[]──→ AggregationsClient
-    ↓
-ModelRouter ──exact count──→ GetQueuePosition
-    ↓ uses FrozenDictionary<string, IReadOnlyList<RemoteModelRoutingRequest>>
+```mermaid
+flowchart TB
+    A["Cosmos DB"] -- "SELECT *" --> B["StorageProvider"]
+    B -- "all docs" --> C["Aggregator"]
+    C -- "caches sorted docs" --> C
+    C -->|"BuildQueuedRequests(instanceId)"| D["gRPC"]
+    D -->|"RemoteRequests[]"| E["Client"]
+    E --> F["ModelRouter"]
+    F -->|"exact count"| G["GetQueuePosition"]
+    F -.->|"remote request map"| H["Router State"]
 ```
 
 ### V2 (Virtual Queue)
 
-```
-Cosmos DB ──GROUP BY──→ StorageProvider ──VirtualQueue[]──→ Aggregator
-    ↓ merges feed-range partials
-    ↓ per gRPC request: returns merged VirtualQueue[]
-    ↓
-gRPC ──VirtualQueue[]──→ AggregationsClient
-    ↓
-ModelRouterV2 ──interpolation──→ GetQueuePosition
-    ↓ uses FrozenDictionary<(string, int), VirtualQueue>
+```mermaid
+flowchart TB
+    A["Cosmos DB"] -- "GROUP BY" --> B["StorageProvider"]
+    B -- "VirtualQueue[]" --> C["Aggregator"]
+    C -- "merges feed-range partials" --> C
+    C -->|"merged VirtualQueue[]"| D["gRPC"]
+    D -->|"VirtualQueue[]"| E["Client"]
+    E --> F["ModelRouterV2"]
+    F -->|"interpolation"| G["GetQueuePosition"]
+    F -.->|"global queue map"| H["Router State"]
 ```
 
 Key differences:
@@ -800,34 +817,57 @@ Key differences:
 
 ## 7. Migration Plan
 
-### Phase 1 — Storage + Aggregator
+Implement in rollout-safe PRs so each deployed phase has a single clear purpose and production behaviour stays stable until prerequisites are already deployed and warmed.
 
-Add `GetVirtualQueueByFeedRangesAsync` to storage provider. Add `EnableVirtualQueueQuery` flag and virtual queue fetch to `ProcessAggregationsCoreAsync`. Add `GetAggregatedViewV2` and `ModelRoutingAggregationsCacheV2`. Add gRPC V2 endpoint. Deploy with all flags `false`. No production behaviour change.
+### Phase/PR1 — Server-side V2 Readonly Data Plane
 
-### Phase 2 — Router V2 + Background Service
+Scope:
+- Add `VirtualQueue`, `ModelRoutingAggregationsV2`, `GetVirtualQueueByFeedRangesAsync`, feed-range merge logic, `cachedAggregationsV2`, proto changes, and the V2 gRPC endpoint.
+- Keep `EnableVirtualQueueQuery = false` by default.
 
-Add `ModelRouterV2`, `VersionedModelRouter`, `IModelRoutingState` changes (`GlobalVirtualQueues`, `SyncGlobalState`), `ModelRoutingAggregationsClient` V2 path, and background service dual-sync path with sync/allocation split. Change `ModelRoutingLeaseFactory` to resolve non-keyed `IModelRouter`. Add `EnableVirtualQueueSync` and `UseVirtualQueue` to `ModelRoutingWithAuthOptions`. Deploy with all flags `false`. V2 code is present but inactive — only V1 sync and V1 allocation run when `EnableVirtualQueueSync` and `UseVirtualQueue` are false.
+Rollout:
+1. Deploy with all flags `false`
+2. Enable `EnableVirtualQueueQuery` in staging
+3. Validate RU, latency, gRPC payload size, and V2 endpoint health
+4. Enable `EnableVirtualQueueQuery` in production
 
-### Phase 3 — Incremental Rollout
+### Phase/PR2 — V1 Refactor To Split Sync From Allocation
 
-Enable flags one at a time per environment, validating each stage before proceeding to the next:
+Scope:
+- Refactor `IRequestAllocationManager`, `ModelRouter`, and `ModelRoutingService` so V1 uses `SyncAggregations(...)` followed by `AllocateQueuedRequests()`.
+- Do not introduce live V2 routing behavior in this PR.
 
-| Step | Flag | What to validate |
-|------|------|-----------------|
-| 3a | `EnableVirtualQueueQuery = true` | Aggregator queries virtual queue from Cosmos DB successfully. Monitor RU consumption. V1 behaviour unchanged since inference is still V1-only. |
-| 3b | `EnableVirtualQueueSync = true` | Inference instances fetch and warm V2 snapshots. Validate gRPC health, memory/cpu overhead, and that allocation still follows V1 because `UseVirtualQueue` is still false. |
-| 3c | `UseVirtualQueue = true` | Router switches live decisions to V2. Validate queue position behaviour, queue-full behaviour, allocation behaviour, and RU reduction. |
+Rollout:
+1. Deploy with no flag change
+2. Validate that V1 routing remains identical
 
-**Sequence per step:**
-1. Staging — validate behaviour and metrics
-2. Production
+### Phase/PR3 — Passive V2 Inference Snapshot Path
 
-**Rollback:** Flip the problematic flag to `false` via Azure App Configuration. Takes effect within ≤ 35 seconds — no deployment, no restart. Roll back in reverse dependency order if needed (`UseVirtualQueue` → `EnableVirtualQueueSync` → `EnableVirtualQueueQuery`).
+Scope:
+- Add inference-side `ModelRoutingAggregationsV2`, `GetAggregatedStateV2Async`, `GlobalVirtualQueues`, `SyncGlobalState`, `EnableVirtualQueueSync`, and the background-service dual-sync path.
+- Constraint: when `UseVirtualQueue = false`, V2 fetch/sync must be best-effort and must not block V1 allocation if it fails.
 
-### Phase 4 — Cleanup
+Rollout:
+1. Deploy with `EnableVirtualQueueSync = false`
+2. Enable `EnableVirtualQueueSync` in staging
+3. Validate V2 fetch health and memory/cpu overhead while allocation still follows V1
+4. Enable `EnableVirtualQueueSync` in production
 
-After V2 is stable in all environments:
+### Phase/PR4 — Live V2 Router Switch
 
+Scope:
+- Add `ModelRouterV2`, `VersionedModelRouter`, DI registration changes, non-keyed `IModelRouter` wiring, and `UseVirtualQueue`.
+- Constraint: depends on PR3 already being deployed and `EnableVirtualQueueSync = true`.
+
+Rollout:
+1. Deploy with `UseVirtualQueue = false`
+2. Enable `UseVirtualQueue` in staging
+3. Validate queue position behaviour, queue-full behaviour, allocation behaviour, queue-depth overshoot, RU reduction, and rollback
+4. Enable `UseVirtualQueue` in production
+
+### Phase/PR5 — Cleanup
+
+Scope:
 1. Remove `ModelRouter` (V1) class and `VersionedModelRouter`
 2. Remove `GetQueuedRequestsByFeedRangesAsync` from `IModelRoutingStorageProvider` and implementation
 3. Remove `BuildAggregatedQueuedRequests` from aggregator
@@ -836,6 +876,18 @@ After V2 is stable in all environments:
 6. Remove `SyncWithRemoteState(ModelRoutingAggregations)` from state
 7. Remove `EnableVirtualQueueQuery`, `EnableVirtualQueueSync`, and `UseVirtualQueue` flags
 8. Rename `ModelRouterV2` → `ModelRouter`, `ModelRoutingAggregationsCacheV2` → `ModelRoutingAggregationsCache`
+
+Rollout:
+1. Only after sufficient production bake time on V2
+2. Only after rollback is no longer required
+
+### Rollback Order
+
+Flip flags in reverse dependency order via Azure App Configuration. Changes propagate within ≤ 35 seconds — no deployment and no restart needed.
+
+1. `UseVirtualQueue = false`
+2. `EnableVirtualQueueSync = false`
+3. `EnableVirtualQueueQuery = false`
 
 ---
 
@@ -875,6 +927,8 @@ After V2 is stable in all environments:
 **Background service:**
 - `EnableVirtualQueueSync = false` → V1 snapshot is refreshed, V2 fetch is skipped, and allocation runs once.
 - `EnableVirtualQueueSync = true` → V1 and V2 snapshots are both refreshed, and allocation still runs exactly once.
+- V2 fetch failure while `UseVirtualQueue = false` → V1 allocation still runs for that tick.
+- V2 fetch failure while `UseVirtualQueue = true` → allocation continues using the last successful V2 snapshot.
 
 ### Staging Validation
 
