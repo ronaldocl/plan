@@ -71,7 +71,7 @@ At small scale (10K), the `GROUP BY` overhead slightly exceeds the savings — V
 
 ### Tradeoff
 
-The virtual queue model trades **exact queue position** for **approximate position via time-based interpolation**. This is acceptable because queue position is used for threshold checks (is capacity available?), not precise ranking. When requests arrive at a steady rate, they are evenly spread across the time range and the interpolation produces the exact position. When arrivals are bursty — for example, a spike of requests clustered near `LastCreatedAt` — the interpolation may overestimate or underestimate a request's position by a few slots. In practice this has minimal impact: the router only needs to know whether a request is "close enough to the front" to receive capacity, not its exact rank in the queue.
+The virtual queue model trades **exact queue position** for **approximate position via time-based interpolation**. This is acceptable because queue position is used for threshold checks (is capacity available?), not precise ranking. When requests arrive at a steady rate, they are evenly spread across the time range and the interpolation produces the exact position. When arrivals are uneven — for example, a spike of requests clustered near <code>LastCreatedAt</code> — the interpolation may overestimate or underestimate a request's position by a few slots. In practice this has minimal impact: the router only needs to know whether a request is "close enough to the front" to receive capacity, not its exact rank in the queue.
 
 The virtual queue router uses the Cosmos-derived global snapshot as the single source of truth. It intentionally accepts snapshot lag for newly queued local requests in exchange for avoiding overlap/deduplication logic between local memory and the global aggregate.
 
@@ -79,13 +79,10 @@ The virtual queue router uses the Cosmos-derived global snapshot as the single s
 
 ## 2. Background
 
-### System Architecture
+The model routing system has two services:
 
-The model routing system spans two services:
-
-**Service.ModelRouting (Aggregator)** polls Cosmos DB every 30 ms, caches aggregated state, and serves per-instance views over gRPC.
-
-**Inference Instances (ModelRouter)** poll the aggregator via gRPC, sync remote state, and allocate queued requests.
+- **Aggregator (Service.ModelRouting)** — polls Cosmos DB every 30 ms, caches aggregated state, and serves per-instance views over gRPC.
+- **Router (Inference Instances)** — polls the aggregator via gRPC, syncs remote state, and allocates queued requests.
 
 ### Current Actual Queue Model
 
@@ -183,35 +180,37 @@ internal interface IQueueCalculator
 
 **Step 2 — Estimate position within the same priority group.** Look up the virtual queue for the request's own `(scenarioId, priority)`. The interpolation direction depends on the queue ordering mode:
 
-- **LIFO** (newer requests served first) — "how many requests were created *after* me?"
 - **FIFO** (older requests served first) — "how many requests were created *before* me?"
+- **LIFO** (newer requests served first) — "how many requests were created *after* me?"
 
-The design supports both modes. This doc uses **LIFO as the example**. The algorithm handles boundary cases first, then interpolates the general case:
+The design supports both modes. This doc uses **FIFO as the example**. The algorithm handles boundary cases first, then interpolates the general case:
 
-| Condition | LIFO Requests Ahead | Reasoning |
-|-----------|---------------------|-----------|
-| `createdAt >= LastCreatedAt` | 0 | Newest in the group — served first under LIFO |
-| `createdAt < FirstCreatedAt` | `QueuedCount` | Older than everything — entire group is ahead |
-| `createdAt == FirstCreatedAt` | `QueuedCount - 1` | Oldest in the group — everyone except self is ahead |
-| Otherwise | interpolate (see below) | General case — interpolates time *after* the request |
+| Condition | FIFO Requests Ahead | LIFO Requests Ahead | Reasoning |
+|-----------|---------------------|---------------------|-----------|
+| `createdAt > LastCreatedAt` | `QueuedCount` | 0 | Newer than everything — served last under FIFO, first under LIFO |
+| `createdAt == LastCreatedAt` | `QueuedCount - 1` | 0 | Newest in the group — everyone except self ahead under FIFO, first under LIFO |
+| `createdAt < FirstCreatedAt` | 0 | `QueuedCount` | Older than everything — served first under FIFO, last under LIFO |
+| `createdAt == FirstCreatedAt` | 0 | `QueuedCount - 1` | Oldest in the group — first under FIFO, everyone except self ahead under LIFO |
+| Otherwise | interpolate (see below) | interpolate (see below) | General case — FIFO interpolates time *before*; LIFO interpolates time *after* |
 
-**General-case interpolation (LIFO):** Assuming requests are uniformly distributed over `[FirstCreatedAt, LastCreatedAt]`, the fraction of the time range that falls *after* the request estimates how many requests were created after it:
-
-```
-lifoRequestsAhead = ceil( (LastCreatedAt - createdAt) / (LastCreatedAt - FirstCreatedAt) * QueuedCount )
-```
-
-For FIFO, invert the LIFO result:
+**General-case interpolation (FIFO):** Assuming requests are uniformly distributed over `[FirstCreatedAt, LastCreatedAt]`, the fraction of the time range that falls *before* the request estimates how many requests were created before it:
 
 ```
-fifoRequestsAhead = QueuedCount - lifoRequestsAhead - 1
+fifoRequestsAhead = min( QueuedCount - 1,
+                         ceil((createdAt - FirstCreatedAt) / (LastCreatedAt - FirstCreatedAt) * QueuedCount) )
+```
+
+For LIFO, invert the FIFO result:
+
+```
+lifoRequestsAhead = QueuedCount - fifoRequestsAhead - 1
 ```
 
 **Final position** = 1 + (higher-priority count) + (same-priority requests ahead)
 
 The `1 +` accounts for the request itself — position 1 means "next to be served."
 
-**Worked example:** Scenario "gpt-4o", priority 2. The global snapshot contains:
+**Worked example (FIFO):** Scenario "gpt-4o", priority 2. The global snapshot contains:
 
 | ScenarioId | Priority | QueuedCount | FirstCreatedAt | LastCreatedAt |
 |------------|----------|-------------|----------------|---------------|
@@ -221,8 +220,8 @@ The `1 +` accounts for the request itself — position 1 means "next to be serve
 
 A request with `createdAt = 10:07:00` at priority 2:
 - Step 1: Higher-priority count = 5 (p=0) + 12 (p=1) = **17**
-- Step 2: Time fraction after request = (10:10:00 - 10:07:00) / (10:10:00 - 10:00:00) = 3/10 = 0.3. Requests ahead at same priority = ceil(0.3 * 100) = **30**
-- Position = 1 + 17 + 30 = **48**
+- Step 2: Time fraction before request = (10:07:00 - 10:00:00) / (10:10:00 - 10:00:00) = 7/10 = 0.7. Requests ahead at same priority = min(99, ceil(0.7 * 100)) = **70**
+- Position = 1 + 17 + 70 = **88**
 
 Under V1 exact counting, this would require fetching and scanning all 117 documents. Under V2, it requires reading 3 virtual queue rows.
 
