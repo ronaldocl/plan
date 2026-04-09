@@ -2,7 +2,7 @@
 
 ## 1. Summary
 
-A virtual queue is proposed to replace per-document tracking with **Cosmos DB server-side aggregation**. Instead of fetching every queued document individually and counting them across the pipeline, the virtual queue pushes aggregation down to Cosmos DB and returns only the summary statistics the router needs.
+This design proposes a **virtual queue** that replaces per-document fetching with **Cosmos DB server-side aggregation**. Instead of pulling every queued document and counting them across the pipeline, the virtual queue lets Cosmos DB compute the aggregate statistics and returns only the summary the router needs.
 
 Today, the actual queue fetches every queued document:
 

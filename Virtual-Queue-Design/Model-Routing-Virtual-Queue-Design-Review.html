@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Model Routing: Virtual Queue Design</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; max-width: 960px; margin: 0 auto; padding: 20px; color: #1d1c1d; }
+  h1 { font-size: 1.6em; border-bottom: 2px solid #e0e0e0; padding-bottom: 8px; }
+  h2 { font-size: 1.3em; border-bottom: 1px solid #e0e0e0; padding-bottom: 6px; margin-top: 32px; }
+  h3 { font-size: 1.1em; margin-top: 24px; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 0.9em; }
+  th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; }
+  th { background-color: #f5f5f5; font-weight: 600; }
+  code { background: #f4f4f4; padding: 1px 4px; border-radius: 3px; font-size: 0.9em; font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+  pre { background: #f4f4f4; padding: 12px; border-radius: 4px; overflow-x: auto; font-size: 0.85em; }
+  pre code { background: none; padding: 0; }
+  hr { border: none; border-top: 1px solid #e0e0e0; margin: 24px 0; }
+  ul, ol { padding-left: 24px; }
+  li { margin-bottom: 4px; }
+  .flow-diagram { background: #f9f9f9; border: 1px solid #e0e0e0; border-radius: 4px; padding: 10px 14px; margin: 10px 0; font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.85em; white-space: pre; overflow-x: auto; }
+</style>
+</head>
+<body>
+
+<h1>Model Routing: Virtual Queue Design</h1>
+
+<h2>1. Summary</h2>
+
+<p>A virtual queue is proposed to replace per-document tracking with <b>Cosmos DB server-side aggregation</b>. Instead of fetching every queued document individually and counting them across the pipeline, the virtual queue pushes aggregation down to Cosmos DB and returns only the summary statistics the router needs.</p>
+
+<p>Today, the actual queue fetches every queued document:</p>
+
+<pre><code>-- Actual Queue: fetches every queued document
+SELECT * FROM modelRoutingRequestsV2 r
+WHERE NOT IS_DEFINED(r.endpoint) OR IS_NULL(r.endpoint)</code></pre>
+
+<p>The virtual queue replaces this with a <code>GROUP BY</code> that returns one summary row per <code>(scenarioId, priority)</code> group containing the count and time range:</p>
+
+<pre><code>-- Virtual Queue: returns aggregated statistics per group
+SELECT r.scenarioId AS scenarioId,
+       r.priority As priority,
+       COUNT(1) AS queuedCount,
+       MIN(r.createdAt) AS firstCreatedAt,
+       MAX(r.createdAt) AS lastCreatedAt
+FROM modelRoutingRequestsV2 r
+WHERE NOT IS_DEFINED(r.endpoint) OR IS_NULL(r.endpoint)
+GROUP BY r.scenarioId, r.priority</code></pre>
+
+<p>The router then estimates queue position via <b>time-based interpolation</b> &mdash; assuming requests are uniformly distributed over <code>[FirstCreatedAt, LastCreatedAt]</code> &mdash; instead of counting individual documents. The number of groups is small (scenarios x priority levels), bounded by configuration, and independent of queued requests count.</p>
+
+<h3>Performance Impact</h3>
+
+<p><b>Test setup:</b> VM with 4 cores, Cosmos DB with 8 physical partitions (feed ranges).</p>
+
+<p><b>Metrics used below:</b></p>
+<ul>
+  <li><b>RU/FR/Query</b> &mdash; RU consumption per query per feed range. Measures the Cosmos DB cost of a single query execution against one physical partition.</li>
+  <li><b>Query latency</b> &mdash; total wall-clock time for concurrent queries across all 8 feed ranges. Measures how long the storage provider call takes end-to-end.</li>
+</ul>
+
+<p><b>Baseline at 60K items, 0% of requests queued (no queue):</b></p>
+
+<table>
+  <tr><th>Metric</th><th>Actual Queue</th><th>Virtual Queue</th></tr>
+  <tr><td><b>Query latency</b></td><td>13.83 ms</td><td>14.82 ms</td></tr>
+  <tr><td><b>RU/FR/Query</b></td><td>3.09</td><td>3.09</td></tr>
+</table>
+
+<p>At zero queue depth both methods are equivalent &mdash; the <code>WHERE</code> filter eliminates all documents before aggregation, so <code>GROUP BY</code> adds negligible overhead.</p>
+
+<p><b>At 60K items, 10% of requests queued:</b></p>
+
+<table>
+  <tr><th>Metric</th><th>Actual Queue</th><th>Virtual Queue</th><th>Improvement</th></tr>
+  <tr><td><b>RU/FR/Query</b></td><td>20.91</td><td>9.48</td><td><b>-55%</b></td></tr>
+  <tr><td><b>Query latency</b></td><td>35.57 ms</td><td>23.52 ms</td><td><b>-34%</b></td></tr>
+</table>
+
+<p>These savings <b>cascade through every layer of the system</b>: less data from Cosmos DB, less memory in the aggregator, smaller gRPC payloads, and O(groups) instead of O(documents) processing on the router side.</p>
+
+<p><b>Full performance comparison at 10% of requests queued across item counts:</b></p>
+
+<table>
+  <tr><th>Item Count</th><th>Avg Lat AQ (ms)</th><th>Avg Lat VQ (ms)</th><th>Latency Delta</th><th>RU/FR/Query AQ</th><th>RU/FR/Query VQ</th><th>RU Saving</th></tr>
+  <tr><td>10K</td><td>17.67</td><td>19.10</td><td>-8.1%</td><td>6.02</td><td>7.60</td><td>-26.2%</td></tr>
+  <tr><td>20K</td><td>20.87</td><td>20.42</td><td>+2.2%</td><td>9.10</td><td>7.76</td><td>14.7%</td></tr>
+  <tr><td>30K</td><td>23.66</td><td>21.06</td><td>+11.0%</td><td>12.08</td><td>8.80</td><td>27.1%</td></tr>
+  <tr><td>40K</td><td>28.13</td><td>23.38</td><td>+16.9%</td><td>14.90</td><td>8.20</td><td>44.9%</td></tr>
+  <tr><td>50K</td><td>30.23</td><td>21.79</td><td>+27.9%</td><td>17.90</td><td>8.75</td><td>51.1%</td></tr>
+  <tr><td>60K</td><td>35.57</td><td>23.52</td><td>+33.9%</td><td>20.91</td><td>9.48</td><td>54.7%</td></tr>
+  <tr><td>80K</td><td>40.65</td><td>23.67</td><td>+41.8%</td><td>26.74</td><td>11.00</td><td>58.9%</td></tr>
+  <tr><td>100K</td><td>47.30</td><td>24.85</td><td>+47.5%</td><td>32.58</td><td>12.54</td><td>61.5%</td></tr>
+</table>
+
+<p>At small scale (10K), the <code>GROUP BY</code> overhead slightly exceeds the savings &mdash; VQ is ~8% slower and ~26% more expensive in RU. <b>The crossover point is ~20K items</b>, after which VQ wins on both latency and RU. The gains widen with scale: actual queue cost grows linearly with document count while virtual queue cost grows with the number of distinct groups (scenarios x priorities) and stays nearly flat. <b>The larger the queue, the greater the savings.</b></p>
+
+<h3>Tradeoff</h3>
+
+<p>The virtual queue model trades <b>exact queue position</b> for <b>approximate position via time-based interpolation</b>. This is acceptable because queue position is used for threshold checks (is capacity available?), not precise ranking. When requests arrive at a steady rate, they are evenly spread across the time range and the interpolation produces the exact position. When arrivals are bursty &mdash; for example, a spike of requests clustered near <code>LastCreatedAt</code> &mdash; the interpolation may overestimate or underestimate a request's position by a few slots. In practice this has minimal impact: the router only needs to know whether a request is "close enough to the front" to receive capacity, not its exact rank in the queue.</p>
+
+<p>The virtual queue router uses the Cosmos-derived global snapshot as the single source of truth. It intentionally accepts snapshot lag for newly queued local requests in exchange for avoiding overlap/deduplication logic between local memory and the global aggregate.</p>
+
+<hr>
+
+<h2>2. Background</h2>
+
+<h3>System Architecture</h3>
+
+<p>The model routing system spans two services:</p>
+
+<p><b>Service.ModelRouting (Aggregator)</b> polls Cosmos DB every 30 ms, caches aggregated state, and serves per-instance views over gRPC.</p>
+
+<p><b>Inference Instances (ModelRouter)</b> poll the aggregator via gRPC, sync remote state, and allocate queued requests.</p>
+
+<h3>Current Actual Queue Model</h3>
+
+<p>The aggregator fetches every queued document (<code>SELECT *</code>), sorts by <code>(ScenarioId, Priority, CreatedAt)</code>, and for each gRPC request builds per-instance <code>RemoteModelRoutingRequest</code> groups. The router stores these and uses exact counting for:</p>
+
+<ul>
+  <li><b>Queue position</b> &mdash; counts remote requests with higher priority or later timestamp</li>
+  <li><b>Queue-full</b> &mdash; sums remote request counts per scenario</li>
+</ul>
+
+<h3>Problems with the Actual Queue Model</h3>
+
+<p>Today, the model routing system fetches <b>every queued request document</b> from Cosmos DB on every aggregation cycle &mdash; roughly every 30 ms. These documents flow through the entire pipeline: the aggregator sorts them and builds per-instance views, gRPC transfers them to every router instance, and each router counts them one-by-one to determine queue positions.</p>
+
+<p>Every layer pays O(N) cost, where N is the number of queued documents:</p>
+
+<table>
+  <tr><th>Layer</th><th>What Happens</th><th>Cost Driver</th></tr>
+  <tr><td><b>Cosmos DB</b></td><td><code>SELECT *</code> on all queued documents</td><td>RU scales linearly with queue depth</td></tr>
+  <tr><td><b>Aggregator</b></td><td>Caches all documents; rebuilds per-instance views per gRPC request</td><td>Memory and CPU scale with document count</td></tr>
+  <tr><td><b>gRPC</b></td><td>Transfers full document set to every router instance</td><td>Payload size scales with document count</td></tr>
+  <tr><td><b>Router</b></td><td>Stores documents per instance; scans for every queue position check</td><td>Memory and computation scale with document count</td></tr>
+</table>
+
+<p>The number of queued documents is <b>unbounded</b> and grows with load &mdash; exactly when the system can least afford the overhead.</p>
+
+<hr>
+
+<h2>3. Requirements</h2>
+
+<ol>
+  <li><b>Storage</b> &mdash; New <code>GetVirtualQueueByFeedRangesAsync</code> method on <code>IModelRoutingStorageProvider</code> returning aggregated virtual queue data</li>
+  <li><b>Data model</b> &mdash; <code>VirtualQueue</code> record and <code>ModelRoutingAggregationsV2</code> carrying virtual queues instead of per-document data</li>
+  <li><b>Aggregator</b> &mdash; <code>EnableVirtualQueueQuery</code> flag gates virtual queue fetch; new <code>GetAggregatedViewV2</code> serves cached V2 data</li>
+  <li><b>gRPC</b> &mdash; New V2 endpoint serving virtual queue aggregations (no <code>instanceId</code> needed &mdash; virtual queues are instance-agnostic)</li>
+  <li><b>Router</b> &mdash; Pluggable <code>IQueueCalculator</code> abstraction; <code>VirtualQueueCalculator</code> with time-based interpolation for queue position</li>
+  <li><b>State</b> &mdash; <code>IModelRoutingState</code> gains <code>GlobalVirtualQueues</code> indexed by <code>(scenarioId, priority)</code> and <code>SyncGlobalState</code> method</li>
+  <li><b>Runtime switch</b> &mdash; Three feature flags for incremental rollout and safe rollback via Azure App Configuration</li>
+</ol>
+
+<hr>
+
+<h2>4. Design</h2>
+
+<h3>4.1 End-to-End Data Flow</h3>
+
+<p><b>Actual Queue:</b></p>
+<div class="flow-diagram">Cosmos DB --[SELECT *]--> StorageProvider --[all docs]--> Aggregator --[per-instance view]--> gRPC --[RemoteRequests[]]--> Router --[exact count]--> QueuePosition</div>
+
+<p><b>Virtual Queue:</b></p>
+<div class="flow-diagram">Cosmos DB --[GROUP BY]--> StorageProvider --[VirtualQueue[]]--> Aggregator --[merged globals]--> gRPC --[VirtualQueue[]]--> Router --[interpolation]--> QueuePosition</div>
+
+<table>
+  <tr><th>Aspect</th><th>V1</th><th>V2</th></tr>
+  <tr><td>Cosmos query</td><td><code>SELECT *</code> (all docs)</td><td><code>GROUP BY</code> (aggregates)</td></tr>
+  <tr><td>Data over gRPC</td><td>O(queued documents)</td><td>O(scenarios x priorities)</td></tr>
+  <tr><td>Per-instance view</td><td>Required</td><td>Not needed (instance-agnostic)</td></tr>
+  <tr><td>Queue position</td><td>Exact count</td><td>Time-based interpolation</td></tr>
+</table>
+
+<h3>4.2 Router &mdash; Single <code>ModelRouter</code> with <code>IQueueCalculator</code></h3>
+
+<p>Rather than forking the entire <code>ModelRouter</code> into a V2 variant, queue math is extracted into a pluggable <code>IQueueCalculator</code> interface:</p>
+
+<pre><code>internal interface IQueueCalculator
+{
+    int GetQueuePosition(IModelRoutingState state, string scenarioId, int priority, DateTimeOffset createdAt);
+    int GetQueuedCount(IModelRoutingState state, string scenarioId, bool isBackfill);
+    string Mode { get; }
+}</code></pre>
+
+<p><code>ModelRouter</code> holds both <code>ActualQueueCalculator</code> and <code>VirtualQueueCalculator</code> and resolves the active one at runtime via <code>IOptionsMonitor&lt;ModelRoutingWithAuthOptions&gt;</code>. All lifecycle management, storage interactions, metrics, and allocation logic remain in one place. The version switch is isolated to queue-specific operations.</p>
+
+<p><b><code>ActualQueueCalculator</code></b> &mdash; preserves the existing exact-count logic using <code>RemoteModelRoutingRequests</code>.</p>
+
+<p><b><code>VirtualQueueCalculator</code></b> &mdash; uses <code>GlobalVirtualQueues</code> with time-based interpolation. The two core operations are queue position estimation and queue-full checking.</p>
+
+<h3>4.3 Virtual Queue Algorithm</h3>
+
+<p><b>Queue Position (<code>GetQueuePosition</code>)</b> answers: "how many requests are ahead of me?" It combines two components:</p>
+
+<p><b>Step 1 &mdash; Count requests at strictly higher priority.</b> Iterate through priority levels in ascending order (lower value = higher priority). For each priority level above the request's own, look up the virtual queue for that <code>(scenarioId, priority)</code> and sum their <code>QueuedCount</code> values. Stop when reaching the request's own priority level.</p>
+
+<p><b>Step 2 &mdash; Estimate position within the same priority group.</b> Look up the virtual queue for the request's own <code>(scenarioId, priority)</code>. The interpolation direction depends on the queue ordering mode:</p>
+
+<ul>
+  <li><b>LIFO</b> (newer requests served first) &mdash; "how many requests were created <i>after</i> me?"</li>
+  <li><b>FIFO</b> (older requests served first) &mdash; "how many requests were created <i>before</i> me?"</li>
+</ul>
+
+<p>The design supports both modes. This doc uses <b>LIFO as the example</b>. The algorithm handles boundary cases first, then interpolates the general case:</p>
+
+<table>
+  <tr><th>Condition</th><th>LIFO Requests Ahead</th><th>Reasoning</th></tr>
+  <tr><td><code>createdAt &gt;= LastCreatedAt</code></td><td>0</td><td>Newest in the group &mdash; served first under LIFO</td></tr>
+  <tr><td><code>createdAt &lt; FirstCreatedAt</code></td><td><code>QueuedCount</code></td><td>Older than everything &mdash; entire group is ahead</td></tr>
+  <tr><td><code>createdAt == FirstCreatedAt</code></td><td><code>QueuedCount - 1</code></td><td>Oldest in the group &mdash; everyone except self is ahead</td></tr>
+  <tr><td>Otherwise</td><td>interpolate (see below)</td><td>General case &mdash; interpolates time <i>after</i> the request</td></tr>
+</table>
+
+<p><b>General-case interpolation (LIFO):</b> Assuming requests are uniformly distributed over <code>[FirstCreatedAt, LastCreatedAt]</code>, the fraction of the time range that falls <i>after</i> the request estimates how many requests were created after it:</p>
+
+<pre><code>lifoRequestsAhead = ceil( (LastCreatedAt - createdAt) / (LastCreatedAt - FirstCreatedAt) * QueuedCount )</code></pre>
+
+<p>For FIFO, invert the LIFO result:</p>
+
+<pre><code>fifoRequestsAhead = QueuedCount - lifoRequestsAhead - 1</code></pre>
+
+<p><b>Final position</b> = 1 + (higher-priority count) + (same-priority requests ahead)</p>
+
+<p>The <code>1 +</code> accounts for the request itself &mdash; position 1 means "next to be served."</p>
+
+<p><b>Worked example:</b> Scenario "gpt-4o", priority 2. The global snapshot contains:</p>
+
+<table>
+  <tr><th>ScenarioId</th><th>Priority</th><th>QueuedCount</th><th>FirstCreatedAt</th><th>LastCreatedAt</th></tr>
+  <tr><td>gpt-4o</td><td>0</td><td>5</td><td>&mdash;</td><td>&mdash;</td></tr>
+  <tr><td>gpt-4o</td><td>1</td><td>12</td><td>&mdash;</td><td>&mdash;</td></tr>
+  <tr><td>gpt-4o</td><td>2</td><td>100</td><td>10:00:00</td><td>10:10:00</td></tr>
+</table>
+
+<p>A request with <code>createdAt = 10:07:00</code> at priority 2:</p>
+<ul>
+  <li>Step 1: Higher-priority count = 5 (p=0) + 12 (p=1) = <b>17</b></li>
+  <li>Step 2: Time fraction after request = (10:10:00 - 10:07:00) / (10:10:00 - 10:00:00) = 3/10 = 0.3. Requests ahead at same priority = ceil(0.3 * 100) = <b>30</b></li>
+  <li>Position = 1 + 17 + 30 = <b>48</b></li>
+</ul>
+
+<p>Under V1 exact counting, this would require fetching and scanning all 117 documents. Under V2, it requires reading 3 virtual queue rows.</p>
+
+<p><b>Queue-Full (<code>GetQueuedCount</code>)</b> answers: "how many total requests are queued for this scenario?" It iterates through all priority levels, summing <code>QueuedCount</code> from each virtual queue matching the scenario. A backfill filter controls whether to count only backfill-priority requests or only non-backfill requests, matching V1's behaviour.</p>
+
+<h3>4.4 Design Constraints</h3>
+
+<p>The V2 calculator uses the Cosmos-derived global snapshot only &mdash; it does not add local in-memory queued requests on top, intentionally accepting snapshot lag to avoid overlap/deduplication complexity. Newly queued local requests become visible after their upsert is observed by the next aggregation snapshot.</p>
+
+<h3>4.5 Runtime Switch and Rollout</h3>
+
+<p>Three feature flags control incremental rollout, each independently togglable via Azure App Configuration (no restart needed):</p>
+
+<table>
+  <tr><th>Stage</th><th>Flag</th><th>Component</th><th>Effect</th><th>Risk</th></tr>
+  <tr><td>1</td><td><code>EnableVirtualQueueQuery</code></td><td>Aggregator</td><td>Queries virtual queue from Cosmos DB, stores in memory</td><td>Low &mdash; read-only</td></tr>
+  <tr><td>2</td><td><code>EnableVirtualQueueSync</code></td><td>Router sync</td><td>Fetches and warms V2 state; routing still uses actual queue</td><td>Low/Medium &mdash; no decision change</td></tr>
+  <tr><td>3</td><td><code>UseVirtualQueue</code></td><td>Router</td><td>Switches live routing to virtual queue calculator</td><td>Medium &mdash; changes decisions</td></tr>
+</table>
+
+<p>Stage dependencies: 2 requires 1 (aggregator must have data), 3 requires 2 (V2 snapshot must be warm). Each can be rolled back independently by flipping the flag. Changes propagate within ~35 seconds.</p>
+
+<p><b>Rollback strategy:</b></p>
+
+<table>
+  <tr><th>Scenario</th><th>Action</th></tr>
+  <tr><td>V2 routing issues</td><td><code>UseVirtualQueue = false</code> &mdash; instant revert to actual queue calculator</td></tr>
+  <tr><td>V2 sync issues</td><td>Disable <code>UseVirtualQueue</code>, then <code>EnableVirtualQueueSync</code></td></tr>
+  <tr><td>Full rollback</td><td>All three flags to <code>false</code> &mdash; pure actual-queue behaviour</td></tr>
+</table>
+
+<h3>4.6 Implementation Plan</h3>
+
+<p>5 phases delivered as separate PRs:</p>
+
+<table>
+  <tr><th>Phase</th><th>PR Scope</th><th>Rollout</th></tr>
+  <tr><td><b>PR1</b></td><td>Server-side V2 data plane (storage, aggregator, proto, gRPC endpoint)</td><td>Deploy dark, enable <code>EnableVirtualQueueQuery</code> in staging then prod</td></tr>
+  <tr><td><b>PR2</b></td><td>Refactor actual-queue path to split sync from allocation</td><td>Deploy, validate no behaviour change</td></tr>
+  <tr><td><b>PR3</b></td><td>Passive V2 inference snapshot path (client, state, background service dual-sync)</td><td>Deploy dark, enable <code>EnableVirtualQueueSync</code> in staging then prod</td></tr>
+  <tr><td><b>PR4</b></td><td>Live V2 queue-calculator switch (<code>IQueueCalculator</code>, both implementations, DI changes)</td><td>Deploy dark, enable <code>UseVirtualQueue</code> in staging then prod</td></tr>
+  <tr><td><b>PR5</b></td><td>Cleanup (remove V1 actual-queue code, flags, and inline V2 as the only path)</td><td>After sufficient production bake time</td></tr>
+</table>
+
+<hr>
+
+<h2>Key Decisions</h2>
+
+<table>
+  <tr><th>Decision</th><th>Rationale</th></tr>
+  <tr><td><b>Single router with pluggable <code>IQueueCalculator</code></b> over separate V2 router</td><td>Most router code is shared (lifecycle, storage, metrics, allocation). Forking duplicates everything for a queue-math change. The <code>IQueueCalculator</code> abstraction isolates the only difference &mdash; queue position and queue-full computation &mdash; behind a clean interface.</td></tr>
+  <tr><td><b>Global snapshot only</b> (no local request deduplication)</td><td>Avoids double-counting complexity. Accepts snapshot lag for newest local enqueues &mdash; an acceptable tradeoff since queue position is a threshold check, not a ranking.</td></tr>
+  <tr><td><b>Time-based interpolation</b> over exact counting</td><td>O(groups) instead of O(documents). Exact under uniform distribution, degrades gracefully otherwise. Queue position only needs to be "correct enough" to determine capacity availability.</td></tr>
+  <tr><td><b>Three-stage feature flags</b></td><td>Enables independent validation at each layer. Each stage can bake in production before the next is enabled. Full rollback is a config change, not a deployment.</td></tr>
+</table>
+
+</body>
+</html>
