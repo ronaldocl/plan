@@ -193,18 +193,24 @@ The design supports both modes. This doc uses **FIFO as the example**. The algor
 | `createdAt == FirstCreatedAt` | 0 | `QueuedCount - 1` | Oldest in the group — first under FIFO, everyone except self ahead under LIFO |
 | Otherwise | interpolate (see below) | interpolate (see below) | General case — FIFO interpolates time *before*; LIFO interpolates time *after* |
 
-**General-case interpolation (FIFO):** Assuming requests are uniformly distributed over `[FirstCreatedAt, LastCreatedAt]`, the fraction of the time range that falls *before* the request estimates how many requests were created before it:
+These boundary rules are approximate when multiple requests share the exact same `createdAt`. With only `QueuedCount`, `FirstCreatedAt`, and `LastCreatedAt`, the virtual queue cannot resolve tie order inside a timestamp bucket, so `createdAt == FirstCreatedAt` and `createdAt == LastCreatedAt` intentionally treat the request as occupying the extreme edge of that bucket.
+
+**General-case interpolation:** Once `createdAt` falls strictly inside `(FirstCreatedAt, LastCreatedAt)`, the request is assumed to already occupy one slot in that priority group. That means there are at most `QueuedCount - 1` *other* same-priority requests ahead of it. Assuming those other requests are uniformly distributed over `[FirstCreatedAt, LastCreatedAt]`, use the time fraction before/after the request to estimate the ahead count:
 
 ```
+fractionBefore = (createdAt - FirstCreatedAt) / (LastCreatedAt - FirstCreatedAt)
+fractionAfter  = (LastCreatedAt - createdAt) / (LastCreatedAt - FirstCreatedAt)
+
 fifoRequestsAhead = min( QueuedCount - 1,
-                         ceil((createdAt - FirstCreatedAt) / (LastCreatedAt - FirstCreatedAt) * QueuedCount) )
+                         ceil(fractionBefore * (QueuedCount - 1)) )
+
+lifoRequestsAhead = min( QueuedCount - 1,
+                         ceil(fractionAfter * (QueuedCount - 1)) )
 ```
 
-For LIFO, invert the FIFO result:
+The important correction is the `QueuedCount - 1` factor: inside the observed time range, the current request is already part of the group, so only the *other* requests can be ahead of it.
 
-```
-lifoRequestsAhead = QueuedCount - fifoRequestsAhead - 1
-```
+This also matches the boundary cases more smoothly. Under FIFO, as soon as `createdAt` moves past `FirstCreatedAt`, the oldest request should already count as ahead, so the estimate should jump to at least 1. Using `ceil(fraction * QueuedCount) - 1` would create a small interval just after `FirstCreatedAt` that still returns 0, and symmetrically under LIFO just before `LastCreatedAt`.
 
 **Final position** = 1 + (higher-priority count) + (same-priority requests ahead)
 
@@ -220,7 +226,7 @@ The `1 +` accounts for the request itself — position 1 means "next to be serve
 
 A request with `createdAt = 10:07:00` at priority 2:
 - Step 1: Higher-priority count = 5 (p=0) + 12 (p=1) = **17**
-- Step 2: Time fraction before request = (10:07:00 - 10:00:00) / (10:10:00 - 10:00:00) = 7/10 = 0.7. Requests ahead at same priority = min(99, ceil(0.7 * 100)) = **70**
+- Step 2: Time fraction before request = (10:07:00 - 10:00:00) / (10:10:00 - 10:00:00) = 7/10 = 0.7. Other same-priority requests = 100 - 1 = 99, so requests ahead at same priority = min(99, ceil(0.7 * 99)) = **70**
 - Position = 1 + 17 + 70 = **88**
 
 Under V1 exact counting, this would require fetching and scanning all 117 documents. Under V2, it requires reading 3 virtual queue rows.

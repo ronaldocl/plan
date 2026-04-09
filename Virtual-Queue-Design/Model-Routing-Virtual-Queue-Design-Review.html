@@ -197,27 +197,35 @@ GROUP BY r.scenarioId, r.priority</code></pre>
 <p><b>Step 2 &mdash; Estimate position within the same priority group.</b> Look up the virtual queue for the request's own <code>(scenarioId, priority)</code>. The interpolation direction depends on the queue ordering mode:</p>
 
 <ul>
-  <li><b>LIFO</b> (newer requests served first) &mdash; "how many requests were created <i>after</i> me?"</li>
   <li><b>FIFO</b> (older requests served first) &mdash; "how many requests were created <i>before</i> me?"</li>
+  <li><b>LIFO</b> (newer requests served first) &mdash; "how many requests were created <i>after</i> me?"</li>
 </ul>
 
-<p>The design supports both modes. This doc uses <b>LIFO as the example</b>. The algorithm handles boundary cases first, then interpolates the general case:</p>
+<p>The design supports both modes. This doc uses <b>FIFO as the example</b>. The algorithm handles boundary cases first, then interpolates the general case:</p>
 
 <table>
-  <tr><th>Condition</th><th>LIFO Requests Ahead</th><th>Reasoning</th></tr>
-  <tr><td><code>createdAt &gt;= LastCreatedAt</code></td><td>0</td><td>Newest in the group &mdash; served first under LIFO</td></tr>
-  <tr><td><code>createdAt &lt; FirstCreatedAt</code></td><td><code>QueuedCount</code></td><td>Older than everything &mdash; entire group is ahead</td></tr>
-  <tr><td><code>createdAt == FirstCreatedAt</code></td><td><code>QueuedCount - 1</code></td><td>Oldest in the group &mdash; everyone except self is ahead</td></tr>
-  <tr><td>Otherwise</td><td>interpolate (see below)</td><td>General case &mdash; interpolates time <i>after</i> the request</td></tr>
+  <tr><th>Condition</th><th>FIFO Requests Ahead</th><th>LIFO Requests Ahead</th><th>Reasoning</th></tr>
+  <tr><td><code>createdAt &gt; LastCreatedAt</code></td><td><code>QueuedCount</code></td><td>0</td><td>Newer than everything &mdash; served last under FIFO, first under LIFO</td></tr>
+  <tr><td><code>createdAt == LastCreatedAt</code></td><td><code>QueuedCount - 1</code></td><td>0</td><td>Newest in the group &mdash; everyone except self ahead under FIFO, first under LIFO</td></tr>
+  <tr><td><code>createdAt &lt; FirstCreatedAt</code></td><td>0</td><td><code>QueuedCount</code></td><td>Older than everything &mdash; served first under FIFO, last under LIFO</td></tr>
+  <tr><td><code>createdAt == FirstCreatedAt</code></td><td>0</td><td><code>QueuedCount - 1</code></td><td>Oldest in the group &mdash; first under FIFO, everyone except self ahead under LIFO</td></tr>
+  <tr><td>Otherwise</td><td>interpolate (see below)</td><td>interpolate (see below)</td><td>General case &mdash; FIFO interpolates time <i>before</i>; LIFO interpolates time <i>after</i></td></tr>
 </table>
 
-<p><b>General-case interpolation (LIFO):</b> Assuming requests are uniformly distributed over <code>[FirstCreatedAt, LastCreatedAt]</code>, the fraction of the time range that falls <i>after</i> the request estimates how many requests were created after it:</p>
+<p><b>General-case interpolation:</b> Once <code>createdAt</code> falls strictly inside <code>(FirstCreatedAt, LastCreatedAt)</code>, the request is assumed to already occupy one slot in that priority group. That means there are at most <code>QueuedCount - 1</code> <i>other</i> same-priority requests ahead of it. Assuming those other requests are uniformly distributed over <code>[FirstCreatedAt, LastCreatedAt]</code>, use the time fraction before/after the request to estimate the ahead count:</p>
 
-<pre><code>lifoRequestsAhead = ceil( (LastCreatedAt - createdAt) / (LastCreatedAt - FirstCreatedAt) * QueuedCount )</code></pre>
+<pre><code>fractionBefore = (createdAt - FirstCreatedAt) / (LastCreatedAt - FirstCreatedAt)
+fractionAfter  = (LastCreatedAt - createdAt) / (LastCreatedAt - FirstCreatedAt)
 
-<p>For FIFO, invert the LIFO result:</p>
+fifoRequestsAhead = min( QueuedCount - 1,
+                         ceil(fractionBefore * (QueuedCount - 1)) )
 
-<pre><code>fifoRequestsAhead = QueuedCount - lifoRequestsAhead - 1</code></pre>
+lifoRequestsAhead = min( QueuedCount - 1,
+                         ceil(fractionAfter * (QueuedCount - 1)) )</code></pre>
+
+<p>The important correction is the <code>QueuedCount - 1</code> factor: inside the observed time range, the current request is already part of the group, so only the <i>other</i> requests can be ahead of it.</p>
+
+<p>This also matches the boundary cases more smoothly. Under FIFO, as soon as <code>createdAt</code> moves past <code>FirstCreatedAt</code>, the oldest request should already count as ahead, so the estimate should jump to at least 1. Using <code>ceil(fraction * QueuedCount) - 1</code> would create a small interval just after <code>FirstCreatedAt</code> that still returns 0, and symmetrically under LIFO just before <code>LastCreatedAt</code>.</p>
 
 <p><b>Final position</b> = 1 + (higher-priority count) + (same-priority requests ahead)</p>
 
@@ -235,8 +243,8 @@ GROUP BY r.scenarioId, r.priority</code></pre>
 <p>A request with <code>createdAt = 10:07:00</code> at priority 2:</p>
 <ul>
   <li>Step 1: Higher-priority count = 5 (p=0) + 12 (p=1) = <b>17</b></li>
-  <li>Step 2: Time fraction after request = (10:10:00 - 10:07:00) / (10:10:00 - 10:00:00) = 3/10 = 0.3. Requests ahead at same priority = ceil(0.3 * 100) = <b>30</b></li>
-  <li>Position = 1 + 17 + 30 = <b>48</b></li>
+  <li>Step 2: Time fraction before request = (10:07:00 - 10:00:00) / (10:10:00 - 10:00:00) = 7/10 = 0.7. Other same-priority requests = 100 - 1 = 99, so requests ahead at same priority = min(99, ceil(0.7 * 99)) = <b>70</b></li>
+  <li>Position = 1 + 17 + 70 = <b>88</b></li>
 </ul>
 
 <p>Under V1 exact counting, this would require fetching and scanning all 117 documents. Under V2, it requires reading 3 virtual queue rows.</p>

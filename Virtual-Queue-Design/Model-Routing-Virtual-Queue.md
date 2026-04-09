@@ -85,9 +85,16 @@ Each `VirtualQueue(ScenarioId, Priority, QueuedCount, FirstCreatedAt, LastCreate
 
 The router estimates queue position via time-based interpolation rather than exact counting:
 
-- If `createdAt >= LastCreatedAt` → 0 requests ahead (newest, served first under LIFO)
-- If `createdAt <= FirstCreatedAt` → all requests ahead (oldest, served last under LIFO)
-- Otherwise → interpolate assuming uniform distribution over `[FirstCreatedAt, LastCreatedAt]`
+- Count all requests at strictly higher priority first.
+- Then estimate the request's position within its own priority group.
+- **FIFO** (older requests served first) asks "how many requests were created before me?"
+- **LIFO** (newer requests served first) asks "how many requests were created after me?"
+- Boundary cases are handled explicitly:
+  - `createdAt > LastCreatedAt` → FIFO `QueuedCount`, LIFO `0`
+  - `createdAt == LastCreatedAt` → FIFO `QueuedCount - 1`, LIFO `0`
+  - `createdAt < FirstCreatedAt` → FIFO `0`, LIFO `QueuedCount`
+  - `createdAt == FirstCreatedAt` → FIFO `0`, LIFO `QueuedCount - 1`
+- Otherwise interpolate over the `QueuedCount - 1` other requests assuming uniform distribution over `[FirstCreatedAt, LastCreatedAt]`
 
 This trades exact position for O(groups) data transfer and computation. In practice the number of groups is small (number of scenarios × number of priority levels) and bounded by configuration, while the number of documents is unbounded.
 
@@ -422,7 +429,43 @@ Acquire and allocation stay unchanged structurally; they call `CurrentQueueCalcu
 
 **Queue position estimation — time-based interpolation:**
 
-The core algorithmic change is in `GetGlobalNumberOfRequestsAhead`. Without individual documents, the router cannot count exact queued requests ahead. Instead it interpolates against the global time range. The method accesses `state` (the `IModelRoutingState` passed to the calculator via `GetQueuePosition`):
+The core algorithmic change is in `GetGlobalNumberOfRequestsAhead`. Without individual documents, the router cannot count exact queued requests ahead. Instead it interpolates against the global time range.
+
+The algorithm has two parts:
+
+1. Count all requests at strictly higher priority (lower priority value).
+2. Estimate how many same-priority requests are ahead based on the queue ordering mode:
+   - **FIFO** (older requests served first): requests created *before* this request are ahead.
+   - **LIFO** (newer requests served first): requests created *after* this request are ahead.
+
+Boundary cases are handled explicitly before interpolation:
+
+| Condition | FIFO Requests Ahead | LIFO Requests Ahead | Reasoning |
+|---|---|---|---|
+| `createdAt > LastCreatedAt` | `QueuedCount` | `0` | Newer than everything — served last under FIFO, first under LIFO |
+| `createdAt == LastCreatedAt` | `QueuedCount - 1` | `0` | Newest in the group — everyone except self ahead under FIFO, first under LIFO |
+| `createdAt < FirstCreatedAt` | `0` | `QueuedCount` | Older than everything — served first under FIFO, last under LIFO |
+| `createdAt == FirstCreatedAt` | `0` | `QueuedCount - 1` | Oldest in the group — first under FIFO, everyone except self ahead under LIFO |
+| Otherwise | interpolate | interpolate | FIFO interpolates time *before*; LIFO interpolates time *after* |
+
+These boundary rules are approximate when multiple requests share the exact same `createdAt`. With only `QueuedCount`, `FirstCreatedAt`, and `LastCreatedAt`, the virtual queue cannot resolve tie order inside a timestamp bucket, so `createdAt == FirstCreatedAt` and `createdAt == LastCreatedAt` intentionally treat the request as occupying the extreme edge of that bucket.
+
+For the general case, once `createdAt` falls strictly inside `(FirstCreatedAt, LastCreatedAt)`, the request is assumed to already occupy one slot in that priority group. That means there are at most `QueuedCount - 1` *other* same-priority requests ahead of it:
+
+```text
+fractionBefore = (createdAt - FirstCreatedAt) / (LastCreatedAt - FirstCreatedAt)
+fractionAfter  = (LastCreatedAt - createdAt) / (LastCreatedAt - FirstCreatedAt)
+
+fifoRequestsAhead = min( QueuedCount - 1,
+                         ceil(fractionBefore * (QueuedCount - 1)) )
+
+lifoRequestsAhead = min( QueuedCount - 1,
+                         ceil(fractionAfter * (QueuedCount - 1)) )
+```
+
+Using `QueuedCount - 1` instead of `QueuedCount` keeps the interpolation aligned with the boundary cases: once a FIFO request moves just past `FirstCreatedAt`, the oldest request should already count as ahead, and symmetrically for LIFO just before `LastCreatedAt`.
+
+Assume the calculator reads a `queueBehavior` option. The cleanest implementation is to share the interpolation helper and switch only the boundary rules and interpolation direction. The method accesses `state` (the `IModelRoutingState` passed to the calculator via `GetQueuePosition`):
 
 ```csharp
 private int GetGlobalNumberOfRequestsAhead(string scenarioId, int priority, DateTimeOffset createdAt)
@@ -443,35 +486,33 @@ private int GetGlobalNumberOfRequestsAhead(string scenarioId, int priority, Date
     if (!state.GlobalVirtualQueues.TryGetValue((scenarioId, priority), out var priorityQueue))
         return globalRequestsWithHigherPriority;
 
-    // Interpolate within the same priority group assuming uniform distribution (LIFO — newer requests served first)
-    int requestsAheadAtSamePriority = createdAt switch
+    int otherRequestsAtSamePriority = priorityQueue.QueuedCount - 1;
+    long timeRangeTicks = (priorityQueue.LastCreatedAt - priorityQueue.FirstCreatedAt).Ticks;
+
+    int InterpolateRequestsAhead(long ticksAhead) => Math.Min(
+        otherRequestsAtSamePriority,
+        (int)Math.Ceiling(1.0 * ticksAhead / timeRangeTicks * otherRequestsAtSamePriority));
+
+    int requestsAheadAtSamePriority = queueBehavior switch
     {
-        // Newest request in the group — no one ahead at this priority (served first under LIFO)
-        _ when createdAt >= priorityQueue.LastCreatedAt => 0,
+        QueueBehavior.Fifo when createdAt > priorityQueue.LastCreatedAt => priorityQueue.QueuedCount,
+        QueueBehavior.Fifo when createdAt == priorityQueue.LastCreatedAt => otherRequestsAtSamePriority,
+        QueueBehavior.Fifo when createdAt <= priorityQueue.FirstCreatedAt => 0,
+        QueueBehavior.Fifo => InterpolateRequestsAhead((createdAt - priorityQueue.FirstCreatedAt).Ticks),
 
-        // Older than everything in the group — everyone in the group is ahead
-        _ when createdAt < priorityQueue.FirstCreatedAt => priorityQueue.QueuedCount,
+        QueueBehavior.Lifo when createdAt >= priorityQueue.LastCreatedAt => 0,
+        QueueBehavior.Lifo when createdAt < priorityQueue.FirstCreatedAt => priorityQueue.QueuedCount,
+        QueueBehavior.Lifo when createdAt == priorityQueue.FirstCreatedAt => otherRequestsAtSamePriority,
+        QueueBehavior.Lifo => InterpolateRequestsAhead((priorityQueue.LastCreatedAt - createdAt).Ticks),
 
-        // Exactly at FirstCreatedAt — this request is itself the oldest in the group,
-        // so everyone except itself is ahead
-        _ when createdAt == priorityQueue.FirstCreatedAt => priorityQueue.QueuedCount - 1,
-
-        // General case: linearly interpolate position within the time range.
-        // Under LIFO, requests created *after* this one are ahead, so we measure
-        // the fraction of the time range that falls after createdAt.
-        _ => Math.Min(
-            priorityQueue.QueuedCount - 1,
-            (int)Math.Ceiling(
-                1.0 * (priorityQueue.LastCreatedAt - createdAt).Ticks
-                    / (priorityQueue.LastCreatedAt - priorityQueue.FirstCreatedAt).Ticks
-                    * priorityQueue.QueuedCount))
+        _ => throw new NotSupportedException($"Unsupported queue behavior: {queueBehavior}")
     };
 
     return globalRequestsWithHigherPriority + requestsAheadAtSamePriority;
 }
 ```
 
-The interpolation assumes LIFO ordering (newer requests are served first, so older requests have more requests ahead of them), matching V1's `GetQueuePosition` which counts remotes where `r.CreatedAt > createdAt`. The fraction `(LastCreatedAt - createdAt) / (LastCreatedAt - FirstCreatedAt)` estimates what proportion of queued requests were created after the current request. This is an approximation — it's exact when requests are uniformly distributed and degrades gracefully when they're not, because the queue position only needs to be correct enough to determine if capacity is available (a threshold check, not a ranking).
+The interpolation is an approximation — it is exact when requests are uniformly distributed and degrades gracefully when they are not, because the queue position only needs to be correct enough to determine if capacity is available (a threshold check, not an exact ranking).
 
 In V2, queue position is derived from the global snapshot only:
 
@@ -929,9 +970,14 @@ Flip flags in reverse dependency order via Azure App Configuration. Changes prop
 
 **VirtualQueueCalculator:**
 - `GetGlobalNumberOfRequestsAhead` interpolation:
-  - `createdAt` after `LastCreatedAt` → returns 0 (newest, served first under LIFO)
-  - `createdAt` before `FirstCreatedAt` → returns full `QueuedCount` (oldest, everyone ahead)
-  - `createdAt` at midpoint → returns ~half of `QueuedCount`
+  - FIFO: `createdAt` after `LastCreatedAt` → returns full `QueuedCount`
+  - FIFO: `createdAt == LastCreatedAt` → returns `QueuedCount - 1`
+  - FIFO: `createdAt` just after `FirstCreatedAt` → returns at least 1, not 0
+  - LIFO: `createdAt` after `LastCreatedAt` → returns 0 (newest, served first)
+  - LIFO: `createdAt` before `FirstCreatedAt` → returns full `QueuedCount` (older than everything, everyone ahead)
+  - LIFO: `createdAt == FirstCreatedAt` → returns `QueuedCount - 1`
+  - LIFO: `createdAt` just before `LastCreatedAt` → returns at least 1, not 0
+  - FIFO/LIFO: midpoint → returns approximately half of `QueuedCount - 1`
   - Single-element queue (`FirstCreatedAt == LastCreatedAt`) with `createdAt` matching → returns 0
 - `GetQueuePosition`: verify it is derived from the global snapshot only and does not add local queued requests on top.
 - `GetQueuedCount(scenarioId, isBackfill)`: verify it returns the global queued count with correct backfill filtering.
