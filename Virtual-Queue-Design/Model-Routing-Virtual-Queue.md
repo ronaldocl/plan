@@ -456,10 +456,6 @@ private int GetGlobalNumberOfRequestsAhead(string scenarioId, int priority, Date
         // so everyone except itself is ahead
         _ when createdAt == priorityQueue.FirstCreatedAt => priorityQueue.QueuedCount - 1,
 
-        // Single-element group where First == Last but createdAt doesn't match either
-        // (shouldn't happen in practice, but guards against division by zero)
-        _ when priorityQueue.FirstCreatedAt == priorityQueue.LastCreatedAt => 0,
-
         // General case: linearly interpolate position within the time range.
         // Under LIFO, requests created *after* this one are ahead, so we measure
         // the fraction of the time range that falls after createdAt.
@@ -937,7 +933,6 @@ Flip flags in reverse dependency order via Azure App Configuration. Changes prop
   - `createdAt` before `FirstCreatedAt` → returns full `QueuedCount` (oldest, everyone ahead)
   - `createdAt` at midpoint → returns ~half of `QueuedCount`
   - Single-element queue (`FirstCreatedAt == LastCreatedAt`) with `createdAt` matching → returns 0
-  - Single-element queue with `createdAt` not matching the timestamp → returns 0 (guards against division by zero in interpolation)
 - `GetQueuePosition`: verify it is derived from the global snapshot only and does not add local queued requests on top.
 - `GetQueuedCount(scenarioId, isBackfill)`: verify it returns the global queued count with correct backfill filtering.
 - Empty virtual queue (no queued requests): `GetQueuePosition` returns 1 (only self) and `GetQueuedCount` returns 0.

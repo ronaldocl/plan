@@ -1,26 +1,38 @@
-# Model Routing: Virtual Queue Migration — Live Review
+# Model Routing: Virtual Queue Design
 
 ## 1. Summary
 
-### Why We Need This Change
+### Problem
 
-The current model routing system fetches **every queued request document** from Cosmos DB on every aggregation cycle. The aggregator sorts them, builds per-instance views, sends them over gRPC, and the router counts them one-by-one to determine queue positions. This O(N) pipeline — where N is the number of queued documents — creates compounding cost at every layer:
+Today, the model routing system fetches **every queued request document** from Cosmos DB on every aggregation cycle — roughly every 30 ms. These documents flow through the entire pipeline: the aggregator sorts them and builds per-instance views, gRPC transfers them to every router instance, and each router counts them one-by-one to determine queue positions.
 
-| Layer | Current Cost |
-|-------|-------------|
-| **Cosmos DB** | `SELECT *` on all queued documents; RU scales linearly with queue depth |
-| **Aggregator** | Holds all documents in memory; rebuilds per-instance views on every gRPC request |
-| **gRPC** | Transfers all documents to every router instance |
-| **Router** | Stores full document set per instance; O(N) counting for every queue position check |
+Every layer pays O(N) cost, where N is the number of queued documents:
+
+| Layer | What Happens | Cost Driver |
+|-------|-------------|-------------|
+| **Cosmos DB** | `SELECT *` on all queued documents | RU scales linearly with queue depth |
+| **Aggregator** | Caches all documents; rebuilds per-instance views per gRPC request | Memory and CPU scale with document count |
+| **gRPC** | Transfers full document set to every router instance | Payload size scales with document count |
+| **Router** | Stores documents per instance; scans for every queue position check | Memory and computation scale with document count |
 
 The number of queued documents is **unbounded** and grows with load — exactly when the system can least afford the overhead.
 
-### What Changes
+### Solution
 
-The virtual queue model replaces per-document tracking with **server-side aggregation**. Instead of fetching every document, Cosmos DB returns one summary row per `(scenarioId, priority)` group:
+The virtual queue model replaces per-document tracking with **Cosmos DB server-side aggregation**. Today, the actual queue fetches every queued document:
 
 ```sql
-SELECT r.scenarioId, r.priority,
+-- Actual Queue: fetches every queued document
+SELECT * FROM modelRoutingRequestsV2 r
+WHERE NOT IS_DEFINED(r.endpoint) OR IS_NULL(r.endpoint)
+```
+
+The virtual queue replaces this with a `GROUP BY` that returns one summary row per `(scenarioId, priority)` group containing the count and time range:
+
+```sql
+-- Virtual Queue: returns aggregated statistics per group
+SELECT r.scenarioId AS scenarioId,
+       r.priority As priority,
        COUNT(1) AS queuedCount,
        MIN(r.createdAt) AS firstCreatedAt,
        MAX(r.createdAt) AS lastCreatedAt
@@ -29,22 +41,22 @@ WHERE NOT IS_DEFINED(r.endpoint) OR IS_NULL(r.endpoint)
 GROUP BY r.scenarioId, r.priority
 ```
 
-The router estimates queue position via **time-based interpolation** against the time range instead of counting individual documents. The number of groups is small (scenarios x priority levels) and bounded by configuration.
+The router then estimates queue position via **time-based interpolation** — assuming requests are uniformly distributed over `[FirstCreatedAt, LastCreatedAt]` — instead of counting individual documents. The number of groups is small (scenarios x priority levels), bounded by configuration, and independent of queue depth.
 
 ### Performance Impact
 
-**At 60K items, 10% queue depth, 8 feed ranges:**
+**At 60K items, 10% of requests queued, 8 feed ranges:**
 
 | Metric | Actual Queue | Virtual Queue | Improvement |
 |--------|-------------|---------------|-------------|
-| **Cosmos RU/FR/req** | 20.91 | 9.48 | **-55%** |
-| **Query latency** | 35.57 ms | 23.52 ms | **-34%** |
+| **RU/FR/Query** (RU consumption per query per feed range) | 20.91 | 9.48 | **-55%** |
+| **Query latency** (total time for concurrent queries across 8 feed ranges) | 35.57 ms | 23.52 ms | **-34%** |
 
-These gains **compound across the system**: less data from Cosmos DB, less memory in the aggregator, smaller gRPC payloads, and O(groups) instead of O(documents) processing at every layer.
+These savings **cascade through every layer of the system**: less data from Cosmos DB, less memory in the aggregator, smaller gRPC payloads, and O(groups) instead of O(documents) processing on the router side.
 
-**Full performance comparison at 10% queue depth across item counts (8 feed ranges):**
+**Full performance comparison at 10% of requests queued across item counts (8 feed ranges):**
 
-| Item Count | Avg Lat QR (ms) | Avg Lat VQ (ms) | Latency Delta | RU/FR/req QR | RU/FR/req VQ | RU Saving |
+| Item Count | Avg Lat AQ (ms) | Avg Lat VQ (ms) | Latency Delta | RU/FR/Query AQ | RU/FR/Query VQ | RU Saving |
 |---|---|---|---|---|---|---|
 | 10K | 17.67 | 19.10 | -8.1% | 6.02 | 7.60 | -26.2% |
 | 20K | 20.87 | 20.42 | +2.2% | 9.10 | 7.76 | 14.7% |
@@ -55,15 +67,15 @@ These gains **compound across the system**: less data from Cosmos DB, less memor
 | 80K | 40.65 | 23.67 | +41.8% | 26.74 | 11.00 | 58.9% |
 | 100K | 47.30 | 24.85 | +47.5% | 32.58 | 12.54 | 61.5% |
 
-At small scale (10K), the `GROUP BY` overhead slightly exceeds the savings — VQ is ~8% slower and ~26% more expensive in RU. **The crossover point is ~20K items**, after which VQ wins on both latency and RU. The gains widen with scale: actual queue cost grows linearly with document count while virtual queue cost grows with the number of distinct groups (scenarios x priorities) and plateaus. **The larger the queue, the greater the savings.**
+At small scale (10K), the `GROUP BY` overhead slightly exceeds the savings — VQ is ~8% slower and ~26% more expensive in RU. **The crossover point is ~20K items**, after which VQ wins on both latency and RU. The gains widen with scale: actual queue cost grows linearly with document count while virtual queue cost grows with the number of distinct groups (scenarios x priorities) and stays nearly flat. **The larger the queue, the greater the savings.**
 
 At zero queue depth both methods are equivalent — the `WHERE` filter eliminates all documents before aggregation, so `GROUP BY` adds negligible overhead.
 
 ### Tradeoff
 
-The virtual queue model trades **exact queue position** for **approximate position via time-based interpolation**. This is acceptable because queue position is used for threshold checks (is capacity available?), not precise ranking. The approximation is exact under uniform distribution and degrades gracefully otherwise.
+The virtual queue model trades **exact queue position** for **approximate position via time-based interpolation**. This is acceptable because queue position is used for threshold checks (is capacity available?), not precise ranking. When requests arrive at a steady rate, they are evenly spread across the time range and the interpolation produces the exact position. When arrivals are bursty — for example, a spike of requests clustered near `LastCreatedAt` — the interpolation may overestimate or underestimate a request's position by a few slots. In practice this has minimal impact: the router only needs to know whether a request is "close enough to the front" to receive capacity, not its exact rank in the queue.
 
-The V2 router uses the Cosmos-derived global snapshot as the sole source of truth. It intentionally accepts snapshot lag for newly queued local requests in exchange for avoiding overlap/reconciliation logic between local memory and the global aggregate.
+The virtual queue router uses the Cosmos-derived global snapshot as the single source of truth. It intentionally accepts snapshot lag for newly queued local requests in exchange for avoiding overlap/deduplication logic between local memory and the global aggregate.
 
 ---
 
@@ -75,11 +87,8 @@ The model routing system spans two services:
 
 **Service.ModelRouting (Aggregator)** polls Cosmos DB every 30 ms, caches aggregated state, and serves per-instance views over gRPC.
 
-**Inference Service Instances (Router)** poll the aggregator via gRPC, sync remote state, and allocate queued requests.
+**Inference Instances (ModelRouter)** poll the aggregator via gRPC, sync remote state, and allocate queued requests.
 
-```
-Cosmos DB → StorageProvider → Aggregator → gRPC → Client → ModelRouter → State
-```
 
 ### Current Actual Queue Model
 
@@ -94,6 +103,7 @@ The aggregator fetches every queued document (`SELECT *`), sorts by `(ScenarioId
 2. **Per-instance view computation** — full scan of all cached documents per gRPC request
 3. **Memory pressure** — aggregator holds tens of thousands of objects under load
 4. **Linear RU cost** — `SELECT *` fetches full documents when only aggregate statistics are needed
+5. **Higher latency** — query time grows linearly with document count, adding delay to every aggregation cycle
 
 ---
 
@@ -113,14 +123,26 @@ The aggregator fetches every queued document (`SELECT *`), sorts by `(ScenarioId
 
 ### 4.1 End-to-End Data Flow
 
-**V1 (Actual Queue):**
-```
-Cosmos DB --[SELECT *]--> StorageProvider --[all docs]--> Aggregator --[per-instance view]--> gRPC --[RemoteRequests[]]--> Router --[exact count]--> QueuePosition
+**Actual Queue:**
+
+```mermaid
+flowchart LR
+    A["Cosmos DB"] -- "SELECT *" --> B["StorageProvider"]
+    B -- "all docs" --> C["Aggregator"]
+    C -- "per-instance view" --> D["gRPC"]
+    D -- "RemoteRequests[]" --> E["Router"]
+    E -- "exact count" --> F["QueuePosition"]
 ```
 
-**V2 (Virtual Queue):**
-```
-Cosmos DB --[GROUP BY]--> StorageProvider --[VirtualQueue[]]--> Aggregator --[merged globals]--> gRPC --[VirtualQueue[]]--> Router --[interpolation]--> QueuePosition
+**Virtual Queue:**
+
+```mermaid
+flowchart LR
+    A["Cosmos DB"] -- "GROUP BY" --> B["StorageProvider"]
+    B -- "VirtualQueue[]" --> C["Aggregator"]
+    C -- "merged globals" --> D["gRPC"]
+    D -- "VirtualQueue[]" --> E["Router"]
+    E -- "interpolation" --> F["QueuePosition"]
 ```
 
 | Aspect | V1 | V2 |
@@ -171,25 +193,31 @@ Queue position answers: "how many requests are ahead of me?" It combines two com
 
 **Step 1 — Count requests at strictly higher priority.** Iterate through priority levels in ascending order (lower value = higher priority). For each priority level above the request's own, look up the virtual queue for that `(scenarioId, priority)` and sum their `QueuedCount` values. Stop when reaching the request's own priority level.
 
-**Step 2 — Estimate position within the same priority group (LIFO interpolation).** Look up the virtual queue for the request's own `(scenarioId, priority)`. The system uses LIFO ordering — newer requests are served first — so the question becomes "how many requests in this group were created *after* me?"
+**Step 2 — Estimate position within the same priority group.** Look up the virtual queue for the request's own `(scenarioId, priority)`. The interpolation direction depends on the queue ordering mode:
 
-The algorithm handles boundary cases first, then interpolates the general case:
+- **LIFO** (newer requests served first) — "how many requests were created *after* me?"
+- **FIFO** (older requests served first) — "how many requests were created *before* me?"
 
-| Condition | Requests Ahead | Reasoning |
-|-----------|---------------|-----------|
+The design supports both modes. This doc uses **LIFO as the example**. The algorithm handles boundary cases first, then interpolates the general case:
+
+| Condition | LIFO Requests Ahead | Reasoning |
+|-----------|---------------------|-----------|
 | `createdAt >= LastCreatedAt` | 0 | Newest in the group — served first under LIFO |
 | `createdAt < FirstCreatedAt` | `QueuedCount` | Older than everything — entire group is ahead |
 | `createdAt == FirstCreatedAt` | `QueuedCount - 1` | Oldest in the group — everyone except self is ahead |
-| `FirstCreatedAt == LastCreatedAt` | 0 | Defensive guard against division by zero |
-| Otherwise | interpolate | General case (see below) |
+| Otherwise | interpolate (see below) | General case — interpolates time *after* the request |
 
-**General-case interpolation:** Assuming requests are uniformly distributed over `[FirstCreatedAt, LastCreatedAt]`, the fraction of the time range that falls *after* the request estimates how many requests were created after it:
+**General-case interpolation (LIFO):** Assuming requests are uniformly distributed over `[FirstCreatedAt, LastCreatedAt]`, the fraction of the time range that falls *after* the request estimates how many requests were created after it:
 
 ```
-requestsAhead = ceil( (LastCreatedAt - createdAt) / (LastCreatedAt - FirstCreatedAt) * QueuedCount )
+lifoRequestsAhead = ceil( (LastCreatedAt - createdAt) / (LastCreatedAt - FirstCreatedAt) * QueuedCount )
 ```
 
-Capped at `QueuedCount - 1` to avoid counting the request itself.
+For FIFO, invert the LIFO result:
+
+```
+fifoRequestsAhead = QueuedCount - lifoRequestsAhead - 1
+```
 
 **Final position** = 1 + (higher-priority count) + (same-priority requests ahead)
 
@@ -216,7 +244,7 @@ Queue-full answers: "how many total requests are queued for this scenario?" It i
 
 #### Design Constraints
 
-The V2 calculator uses the Cosmos-derived global snapshot only — it does not add local in-memory queued requests on top, intentionally accepting snapshot lag to avoid overlap/reconciliation complexity. Newly queued local requests become visible after their upsert is observed by the next aggregation snapshot.
+The V2 calculator uses the Cosmos-derived global snapshot only — it does not add local in-memory queued requests on top, intentionally accepting snapshot lag to avoid overlap/deduplication complexity. Newly queued local requests become visible after their upsert is observed by the next aggregation snapshot.
 
 ### 4.6 Background Service Changes
 
@@ -260,8 +288,7 @@ Stage dependencies: 2 requires 1 (aggregator must have data), 3 requires 2 (V2 s
 
 | Decision | Rationale |
 |----------|-----------|
-| **Single router with strategy pattern** over separate V2 router | Most router code is shared (lifecycle, storage, metrics, allocation). Forking duplicates everything for a queue-math change. Strategy pattern isolates the difference cleanly. |
-| **Global snapshot only** (no local request reconciliation) | Avoids double-counting complexity. Accepts snapshot lag for newest local enqueues — an acceptable tradeoff since queue position is a threshold check, not a ranking. |
+| **Single router with pluggable `IQueueCalculator`** over separate V2 router | Most router code is shared (lifecycle, storage, metrics, allocation). Forking duplicates everything for a queue-math change. The `IQueueCalculator` abstraction isolates the only difference — queue position and queue-full computation — behind a clean interface. |
+| **Global snapshot only** (no local request deduplication) | Avoids double-counting complexity. Accepts snapshot lag for newest local enqueues — an acceptable tradeoff since queue position is a threshold check, not a ranking. |
 | **Time-based interpolation** over exact counting | O(groups) instead of O(documents). Exact under uniform distribution, degrades gracefully otherwise. Queue position only needs to be "correct enough" to determine capacity availability. |
 | **Three-stage feature flags** | Enables independent validation at each layer. Each stage can bake in production before the next is enabled. Full rollback is a config change, not a deployment. |
-| **LIFO ordering** | Matches V1's queue position semantics where newer requests are served first. |
