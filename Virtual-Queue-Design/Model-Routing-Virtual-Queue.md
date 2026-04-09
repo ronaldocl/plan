@@ -13,7 +13,7 @@ This is an end-to-end change spanning four system boundaries:
 1. **Storage** — new `GetVirtualQueueByFeedRangesAsync` on `IModelRoutingStorageProvider`
 2. **Aggregator** — `EnableVirtualQueueQuery` flag gates virtual queue fetch in `ProcessAggregationsCoreAsync`; new `GetAggregatedViewV2` serves cached V2 data
 3. **gRPC API** — new endpoint serving virtual queue aggregations
-4. **Router** — new `ModelRouterV2` using a global virtual queue snapshot with time-based interpolation
+4. **Router** — existing `ModelRouter` gains pluggable `IQueueCalculator` implementations and can use a global virtual queue snapshot with time-based interpolation
 
 At 60K items with 10% queue depth, the virtual queue query reduces RU/feed-range/request by ~55% and latency by ~34%. The reduction compounds across the system: less data transferred from Cosmos DB, less memory in the aggregator, smaller gRPC payloads, and O(groups) instead of O(documents) processing on the router side.
 
@@ -85,15 +85,15 @@ Each `VirtualQueue(ScenarioId, Priority, QueuedCount, FirstCreatedAt, LastCreate
 
 The router estimates queue position via time-based interpolation rather than exact counting:
 
-- If `createdAt >= LastCreatedAt` → all requests ahead (newest)
-- If `createdAt <= FirstCreatedAt` → 0 requests ahead (oldest)
+- If `createdAt >= LastCreatedAt` → 0 requests ahead (newest, served first under LIFO)
+- If `createdAt <= FirstCreatedAt` → all requests ahead (oldest, served last under LIFO)
 - Otherwise → interpolate assuming uniform distribution over `[FirstCreatedAt, LastCreatedAt]`
 
 This trades exact position for O(groups) data transfer and computation. In practice the number of groups is small (number of scenarios × number of priority levels) and bounded by configuration, while the number of documents is unbounded.
 
 ### 2.5 Performance Comparison
 
-**No-Queue Baseline (Queue = 0%, Item Count = 60K):**
+**Actual Queue (QR) vs Virtual Queue (VQ) at 60K Items:**
 
 | Scenario | Avg Latency (ms) | RU/FR/req |
 |---|---|---|
@@ -127,7 +127,7 @@ QR cost scales linearly with document count; VQ cost scales with the number of d
 2. **New data model** — `VirtualQueue` record and `ModelRoutingAggregationsV2` carrying virtual queues instead of per-document queued requests.
 3. **Aggregator V2 path** — `EnableVirtualQueueQuery` flag in `ProcessAggregationsCoreAsync` gates virtual queue fetch; new `GetAggregatedViewV2` on `IModelRoutingAggregator` serves cached V2 data.
 4. **gRPC V2 endpoint** — new RPC serving virtual queue aggregations to router instances.
-5. **Router V2** — `ModelRouterV2` consuming a global virtual queue snapshot with time-based interpolation for queue position.
+5. **Virtual queue calculator** — `ModelRouter` consuming a global virtual queue snapshot through `VirtualQueueCalculator` with time-based interpolation for queue position.
 6. **State model update** — `IModelRoutingState` gains `GlobalVirtualQueues` and `SyncGlobalState(ModelRoutingAggregationsV2)`.
 7. **Runtime switch** — Three feature flags (`EnableVirtualQueueQuery`, `EnableVirtualQueueSync`, `UseVirtualQueue`) for incremental rollout and safe rollback via Azure App Configuration.
 
@@ -372,28 +372,63 @@ public override Task<External.GetModelRoutingAggregationsV2Response> GetModelRou
 }
 ```
 
-Same pattern as V1 — reads from the volatile `cachedAggregationsV2` snapshot populated by `ProcessAggregationsCoreAsync`.
+Same pattern as the existing gRPC endpoint — reads from the volatile `cachedAggregationsV2` snapshot populated by `ProcessAggregationsCoreAsync`.
 
-### 4.5 Router — `ModelRouterV2`
+### 4.5 Router — single `ModelRouter` with `IQueueCalculator`
 
-Create `ModelRouterV2` as a new class implementing `IModelRouter` and `IRequestAllocationManager`. The V2 router replaces `RemoteModelRoutingRequests` with `GlobalVirtualQueues` and uses time-based interpolation for queue position estimation.
+Keep a single `ModelRouter` implementing `IModelRouter` and `IRequestAllocationManager`. The router continues to own acquire/release, queued request allocation, cleanup loops, storage writes, and usage/logging. The only V1/V2 difference that moves out of the router is queue math: queue position and queue-full calculation.
 
-**Why a new class instead of branching in `ModelRouter`:**
+This avoids the main downside of a separate V2 router implementation: most router code is shared, so forking the entire class duplicates lifecycle management, storage interactions, metrics/logging, and allocation flow for what is fundamentally a queue-math change. It also avoids scattering `if (UseVirtualQueue)` across the whole router. The version switch is isolated to the queue-specific operations.
 
-- `ModelRouter` uses `IReadOnlyList<RemoteModelRoutingRequest>` (per-instance, ordered entries) throughout `GetQueuePosition`, `GetQueuedCount`, and `AllocateQueuedRequests`. The virtual queue model uses `FrozenDictionary<(string ScenarioId, int Priority), VirtualQueue>` representing the global queue snapshot — a fundamentally different data structure and access pattern.
-- Queue position estimation changes from exact counting to time-based interpolation — the algorithm itself is different, not just the data source.
-- `IModelRoutingState` requires different fields (`GlobalVirtualQueues` vs `RemoteModelRoutingRequests`) and a different sync method (`SyncGlobalState(ModelRoutingAggregationsV2)` vs `SyncWithRemoteState(ModelRoutingAggregations)`).
-- Branching every access point in a 730-line class with concurrent state management creates risk disproportionate to the transition period. A separate class keeps both paths clean and testable.
-- `VersionedModelRouter` delegates runtime decisions based on the `UseVirtualQueue` flag, while the background service keeps both V1 and V2 state snapshots warm during rollout for safe rollback.
+**New abstraction:**
+
+```csharp
+internal interface IQueueCalculator
+{
+    int GetQueuePosition(IModelRoutingState state, string scenarioId, int priority, DateTimeOffset createdAt);
+    int GetQueuedCount(IModelRoutingState state, string scenarioId, bool isBackfill);
+    string Mode { get; }
+}
+```
+
+`ModelRouter` holds both calculators and resolves the active one from an `IOptionsMonitor<ModelRoutingWithAuthOptions>`:
+
+```csharp
+public ModelRouter(
+    ...,
+    [FromKeyedServices("ActualQueue")] IQueueCalculator actualQueueCalculator,
+    [FromKeyedServices("VirtualQueue")] IQueueCalculator virtualQueueCalculator,
+    IOptionsMonitor<ModelRoutingWithAuthOptions> optionsMonitor)
+{
+    this.actualQueueCalculator = actualQueueCalculator;
+    this.virtualQueueCalculator = virtualQueueCalculator;
+    this.optionsMonitor = optionsMonitor;
+}
+
+private IQueueCalculator CurrentQueueCalculator =>
+    optionsMonitor.CurrentValue.UseVirtualQueue ? virtualQueueCalculator : actualQueueCalculator;
+```
+
+Acquire and allocation stay unchanged structurally; they call `CurrentQueueCalculator.GetQueuePosition(...)` and `CurrentQueueCalculator.GetQueuedCount(...)` at the decision points where the queue model matters. This keeps concurrency and cleanup logic in one place and preserves one set of telemetry event names. Logs and metrics can add a structured dimension such as `queueMode=actual|virtual` instead of creating duplicate V2-specific events.
+
+**`ActualQueueCalculator`:**
+- Uses `RemoteModelRoutingRequests` and the existing exact counting logic.
+- Preserves current queue position and queue-full behaviour.
+
+**`VirtualQueueCalculator`:**
+- Uses `GlobalVirtualQueues` and time-based interpolation.
+- Uses the Cosmos-derived global snapshot only; it does not add local in-memory queued requests on top.
+- Intentionally accepts snapshot lag for newly queued local requests in exchange for avoiding overlap/reconciliation logic.
 
 **Queue position estimation — time-based interpolation:**
 
-The core algorithmic change is in `GetGlobalNumberOfRequestsAhead`. Without individual documents, the router cannot count exact queued requests ahead. Instead it interpolates against the global time range:
+The core algorithmic change is in `GetGlobalNumberOfRequestsAhead`. Without individual documents, the router cannot count exact queued requests ahead. Instead it interpolates against the global time range. The method accesses `state` (the `IModelRoutingState` passed to the calculator via `GetQueuePosition`):
 
 ```csharp
 private int GetGlobalNumberOfRequestsAhead(string scenarioId, int priority, DateTimeOffset createdAt)
 {
-    // PriorityValues: pre-computed array of all priority int values, e.g. [0, 1, 2, 3, 4, 5, 6]
+    // PriorityValues: static pre-computed array of all priority int values ordered ascending,
+    // e.g. [0, 1, 2, 3, 4, 5, 6]. Defined as a shared constant on the calculator.
     // Count all queued requests with strictly higher priority (lower priority value)
     int globalRequestsWithHigherPriority = 0;
     foreach (int p in PriorityValues)
@@ -408,16 +443,30 @@ private int GetGlobalNumberOfRequestsAhead(string scenarioId, int priority, Date
     if (!state.GlobalVirtualQueues.TryGetValue((scenarioId, priority), out var priorityQueue))
         return globalRequestsWithHigherPriority;
 
-    // Interpolate within the same priority group assuming uniform distribution (FIFO — earlier requests served first)
+    // Interpolate within the same priority group assuming uniform distribution (LIFO — newer requests served first)
     int requestsAheadAtSamePriority = createdAt switch
     {
-        _ when createdAt <= priorityQueue.FirstCreatedAt => 0,
-        _ when createdAt > priorityQueue.LastCreatedAt => priorityQueue.QueuedCount,
-        _ when createdAt == priorityQueue.LastCreatedAt => priorityQueue.QueuedCount - 1,
+        // Newest request in the group — no one ahead at this priority (served first under LIFO)
+        _ when createdAt >= priorityQueue.LastCreatedAt => 0,
+
+        // Older than everything in the group — everyone in the group is ahead
+        _ when createdAt < priorityQueue.FirstCreatedAt => priorityQueue.QueuedCount,
+
+        // Exactly at FirstCreatedAt — this request is itself the oldest in the group,
+        // so everyone except itself is ahead
+        _ when createdAt == priorityQueue.FirstCreatedAt => priorityQueue.QueuedCount - 1,
+
+        // Single-element group where First == Last but createdAt doesn't match either
+        // (shouldn't happen in practice, but guards against division by zero)
+        _ when priorityQueue.FirstCreatedAt == priorityQueue.LastCreatedAt => 0,
+
+        // General case: linearly interpolate position within the time range.
+        // Under LIFO, requests created *after* this one are ahead, so we measure
+        // the fraction of the time range that falls after createdAt.
         _ => Math.Min(
             priorityQueue.QueuedCount - 1,
             (int)Math.Ceiling(
-                1.0 * (createdAt - priorityQueue.FirstCreatedAt).Ticks
+                1.0 * (priorityQueue.LastCreatedAt - createdAt).Ticks
                     / (priorityQueue.LastCreatedAt - priorityQueue.FirstCreatedAt).Ticks
                     * priorityQueue.QueuedCount))
     };
@@ -426,7 +475,7 @@ private int GetGlobalNumberOfRequestsAhead(string scenarioId, int priority, Date
 }
 ```
 
-The interpolation assumes FIFO ordering (earlier requests are ahead), matching V1's `GetQueuePosition` which counts remotes where `r.CreatedAt < createdAt`. The fraction `(createdAt - FirstCreatedAt) / (LastCreatedAt - FirstCreatedAt)` estimates what proportion of queued requests were created before the current request. This is an approximation — it's exact when requests are uniformly distributed and degrades gracefully when they're not, because the queue position only needs to be correct enough to determine if capacity is available (a threshold check, not a ranking).
+The interpolation assumes LIFO ordering (newer requests are served first, so older requests have more requests ahead of them), matching V1's `GetQueuePosition` which counts remotes where `r.CreatedAt > createdAt`. The fraction `(LastCreatedAt - createdAt) / (LastCreatedAt - FirstCreatedAt)` estimates what proportion of queued requests were created after the current request. This is an approximation — it's exact when requests are uniformly distributed and degrades gracefully when they're not, because the queue position only needs to be correct enough to determine if capacity is available (a threshold check, not a ranking).
 
 In V2, queue position is derived from the global snapshot only:
 
@@ -457,6 +506,8 @@ private int GetQueuedCount(string scenarioId, bool isBackfill)
 ```
 
 This is the simplest reconciliation rule: V2 queue-full checks use the same lagging global snapshot as queue position. That avoids double-counting local requests already reflected in Cosmos DB, at the cost of delayed visibility for the newest local enqueues.
+
+The important design point is that these algorithms live in `VirtualQueueCalculator`, not in a second full router class.
 
 ### 4.6 `IModelRoutingState` Changes
 
@@ -545,7 +596,7 @@ private static VirtualQueue ToInternalVirtualQueue(Picasso.ModelRouting.Api.Exte
 
 ### 4.8 `ModelRoutingService` (BackgroundService) Changes
 
-The background service on each inference instance syncs state through `IRequestAllocationManager` (resolved to `VersionedModelRouter`). To support safe cutover, sync and allocation are split: the service always refreshes the V1 snapshot, optionally refreshes the V2 snapshot when `EnableVirtualQueueSync` is enabled, and runs allocation once through the currently selected router. The V2 sync path is best-effort while `UseVirtualQueue` is `false`, so a V2 fetch failure must not suppress V1 allocation. Once `UseVirtualQueue` is `true`, the router continues using the last successful V2 snapshot if a later V2 fetch fails. Change from `IOptions` to `IOptionsMonitor` to support runtime flag toggling without restart:
+The background service on each inference instance syncs state through `IRequestAllocationManager` (resolved to `ModelRouter`). To support safe cutover, sync and allocation are split: the service always refreshes the actual-queue snapshot, optionally refreshes the virtual-queue snapshot when `EnableVirtualQueueSync` is enabled, and runs allocation once through the same router instance. The V2 sync path is best-effort while `UseVirtualQueue` is `false`, so a V2 fetch failure must not suppress actual-queue allocation. Once `UseVirtualQueue` is `true`, the router continues using the last successful V2 snapshot if a later V2 fetch fails. Change from `IOptions` to `IOptionsMonitor` to support runtime flag toggling without restart:
 
 ```csharp
 protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -555,7 +606,6 @@ protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         try
         {
-            var useVirtualQueue = options.CurrentValue.UseVirtualQueue;
             var aggregations = await aggregationsClient.GetAggregatedStateAsync(requestManager.InstanceId, stoppingToken);
             requestManager.SyncAggregations(aggregations);
 
@@ -569,13 +619,6 @@ protected override async Task ExecuteAsync(CancellationToken stoppingToken)
                 catch (Exception ex) when (ex.IsNotCancelled())
                 {
                     logger.FailedToSyncV2(ex);
-
-                    // Before V2 is live, V2 sync is best-effort and must not block V1 allocation.
-                    // After V2 is live, continue with the last successful V2 snapshot already in memory.
-                    if (useVirtualQueue)
-                    {
-                        // No-op: keep the last successful V2 snapshot.
-                    }
                 }
             }
 
@@ -621,10 +664,10 @@ internal sealed record ModelRoutingWithAuthOptions
 {
     // ... existing properties ...
 
-    // Stage 2: Background service fetches and warms the V2 snapshot, but routing decisions stay on V1.
+    // Stage 2: Background service fetches and warms the V2 snapshot, but routing still uses ActualQueueCalculator.
     public bool EnableVirtualQueueSync { get; init; }
 
-    // Stage 3: Router switches from V1 to V2 for acquire/release decisions.
+    // Stage 3: ModelRouter switches from ActualQueueCalculator to VirtualQueueCalculator.
     public bool UseVirtualQueue { get; init; }
 }
 ```
@@ -633,45 +676,36 @@ internal sealed record ModelRoutingWithAuthOptions
 
 | Stage | Flag | Component | Effect | Risk |
 |-------|------|-----------|--------|------|
-| 1 | `EnableVirtualQueueQuery` | Aggregator | Queries virtual queue from Cosmos DB, stores in memory. V1 aggregation unchanged. | Low — read-only, no downstream impact |
-| 2 | `EnableVirtualQueueSync` | Router background sync | Fetches and warms V2 state on every sync cycle, but leaves live decisions on V1. | Low/Medium — extra gRPC and memory, no decision change |
-| 3 | `UseVirtualQueue` | Router | Switches `VersionedModelRouter` from V1 to V2 after both snapshots are warm. | Medium — changes routing decisions |
+| 1 | `EnableVirtualQueueQuery` | Aggregator | Queries virtual queue from Cosmos DB, stores in memory. Existing actual-queue aggregation is unchanged. | Low — read-only, no downstream impact |
+| 2 | `EnableVirtualQueueSync` | Router background sync | Fetches and warms V2 state on every sync cycle, but live decisions still use `ActualQueueCalculator`. | Low/Medium — extra gRPC and memory, no decision change |
+| 3 | `UseVirtualQueue` | Router | Switches `ModelRouter` from the actual-queue calculator to the virtual-queue calculator after both snapshots are warm. | Medium — changes routing decisions |
 
-Each stage can be enabled independently and rolled back by flipping the flag. Stage 2 depends on stage 1 being active (the aggregator must have virtual queue data for the V2 gRPC endpoint to serve). Stage 3 depends on stage 2 being active so the V2 router already has a fresh snapshot before it receives live traffic. Stage 1 can run safely without stages 2 and 3, and stage 2 can run safely without stage 3.
+Each stage can be enabled independently and rolled back by flipping the flag. Stage 2 depends on stage 1 being active (the aggregator must have virtual queue data for the V2 gRPC endpoint to serve). Stage 3 depends on stage 2 being active so the V2 snapshot is already warm before live routing switches to it. Stage 1 can run safely without stages 2 and 3, and stage 2 can run safely without stage 3.
 
-**DI registration** — `VersionedModelRouter` implements both `IModelRouter` and `IRequestAllocationManager`, replacing the direct `ModelRouter` registration for `IRequestAllocationManager`:
+**DI registration** — keep a single non-keyed `ModelRouter` as both `IModelRouter` and `IRequestAllocationManager`, and add keyed queue-calculator implementations:
 
 ```csharp
-// Existing keyed registrations (already in AppStartup.cs)
+// Queue calculator registrations
 services
-    .AddKeyedSingleton<IModelRouter, ModelRouter>("ModelRouter")
+    .AddKeyedSingleton<IQueueCalculator, ActualQueueCalculator>("ActualQueue")
+    .AddKeyedSingleton<IQueueCalculator, VirtualQueueCalculator>("VirtualQueue")
     .AddKeyedSingleton<IModelRouter, WeightedModelRouter>("WeightedModelRouter");
 
-// New: register ModelRouterV2 as keyed singleton
-services
-    .AddKeyedSingleton<IModelRouter, ModelRouterV2>("ModelRouterV2");
-
-// New: register VersionedModelRouter as both IModelRouter and IRequestAllocationManager
-// Replaces the existing: .AddSingleton<IRequestAllocationManager, ModelRouter>()
-services.AddSingleton<VersionedModelRouter>(sp =>
-{
-    var v1 = sp.GetRequiredKeyedService<IModelRouter>("ModelRouter");
-    var v2 = sp.GetRequiredKeyedService<IModelRouter>("ModelRouterV2");
-    var optionsMonitor = sp.GetRequiredService<IOptionsMonitor<ModelRoutingWithAuthOptions>>();
-    return new VersionedModelRouter(v1, v2, optionsMonitor);
-});
-services.AddSingleton<IModelRouter>(sp => sp.GetRequiredService<VersionedModelRouter>());
-services.AddSingleton<IRequestAllocationManager>(sp => sp.GetRequiredService<VersionedModelRouter>());
+services.AddSingleton<ModelRouter>();
+services.AddSingleton<IModelRouter>(sp => sp.GetRequiredService<ModelRouter>());
+services.AddSingleton<IRequestAllocationManager>(sp => sp.GetRequiredService<ModelRouter>());
 ```
 
-**`ModelRoutingLeaseFactory` change** — update to resolve non-keyed `IModelRouter` so it routes through `VersionedModelRouter`:
+`ModelRouter` constructor adds both queue-calculator implementations plus `IOptionsMonitor<ModelRoutingWithAuthOptions>`, and selects the active calculator at runtime. No delegating wrapper is required.
+
+**`ModelRoutingLeaseFactory` change** — resolve non-keyed `IModelRouter` so the lease path follows the live queue-calculator choice inside `ModelRouter`:
 
 ```csharp
 // Before: [FromKeyedServices("ModelRouter")] IModelRouter modelRouter
 // After:
 internal sealed partial class ModelRoutingLeaseFactory(
     ...
-    IModelRouter modelRouter) : IModelRoutingLeaseFactory   // resolves to VersionedModelRouter
+    IModelRouter modelRouter) : IModelRoutingLeaseFactory   // resolves to ModelRouter
 ```
 
 **`IRequestAllocationManager` — split sync from allocation:**
@@ -680,57 +714,47 @@ internal sealed partial class ModelRoutingLeaseFactory(
 internal interface IRequestAllocationManager
 {
     PicassoId InstanceId { get; }
-    void SyncAggregations(ModelRoutingAggregations aggregations);      // V1 sync only
-    void SyncAggregationsV2(ModelRoutingAggregationsV2 aggregations);  // V2 sync only
-    void AllocateQueuedRequests();                                     // delegates to current router
+    void SyncAggregations(ModelRoutingAggregations aggregations);      // actual-queue snapshot
+    void SyncAggregationsV2(ModelRoutingAggregationsV2 aggregations);  // virtual-queue snapshot
+    void AllocateQueuedRequests();                                     // router-owned allocation loop; queue math comes from IQueueCalculator
 }
 ```
 
-**`VersionedModelRouter`** — implements both `IModelRouter` and `IRequestAllocationManager`, delegating to V1 and V2 routers:
+**`ModelRouter` integration points** — one router owns all lifecycle and delegates only queue math:
 
 ```csharp
-/// <summary>
-/// Delegates live routing decisions to V1 or V2 based on the live UseVirtualQueue flag.
-/// V1 and V2 state sync are routed explicitly so both snapshots can stay warm
-/// during rollout while allocation runs only once through the active router.
-/// </summary>
-internal sealed class VersionedModelRouter(
-    IModelRouter v1,
-    IModelRouter v2,
-    IOptionsMonitor<ModelRoutingWithAuthOptions> optionsMonitor) : IModelRouter, IRequestAllocationManager
+internal sealed partial class ModelRouter : IModelRouter, IRequestAllocationManager, IAsyncDisposable
 {
-    private IModelRouter Current =>
-        optionsMonitor.CurrentValue.UseVirtualQueue ? v2 : v1;
+    private IQueueCalculator CurrentQueueCalculator =>
+        optionsMonitor.CurrentValue.UseVirtualQueue ? virtualQueueCalculator : actualQueueCalculator;
 
-    // IModelRouter — delegates based on UseVirtualQueue flag
-    public Task<IAcquireResult> AcquireAsync(string scenarioId, InferencePriority priority, TimeSpan? acquireTimeout, CancellationToken cancellationToken) =>
-        Current.AcquireAsync(scenarioId, priority, acquireTimeout, cancellationToken);
-
-    public void Release(PicassoId requestId, ModelRoutingUnifiedStatusCode statusCode, TimeSpan duration) =>
-        Current.Release(requestId, statusCode, duration);
-
-    // IRequestAllocationManager — V1 sync always goes to V1 router, V2 sync always goes to V2 router
-    public PicassoId InstanceId => ((IRequestAllocationManager)v1).InstanceId;
-
-    public void SyncAggregations(ModelRoutingAggregations aggregations) =>
-        ((IRequestAllocationManager)v1).SyncAggregations(aggregations);
+    public void SyncAggregations(ModelRoutingAggregations aggregations)
+    {
+        state.SyncWithRemoteState(aggregations);
+        ReportAggregatedUsageMetrics(aggregations);
+    }
 
     public void SyncAggregationsV2(ModelRoutingAggregationsV2 aggregations) =>
-        ((IRequestAllocationManager)v2).SyncAggregationsV2(aggregations);
+        state.SyncGlobalState(aggregations);
 
-    public void AllocateQueuedRequests() =>
-        ((IRequestAllocationManager)Current).AllocateQueuedRequests();
+    private int GetQueuePosition(string scenarioId, int priority, DateTimeOffset createdAt) =>
+        CurrentQueueCalculator.GetQueuePosition(state, scenarioId, priority, createdAt);
+
+    private int GetQueuedCount(string scenarioId, bool isBackfill) =>
+        CurrentQueueCalculator.GetQueuedCount(state, scenarioId, isBackfill);
 }
 ```
+
+This keeps rollout safety, but avoids a second full router class and preserves one set of logs, activities, and cleanup behavior.
 
 **Rollback strategy:** Roll back in reverse order by flipping flags in Azure App Configuration. Changes propagate within ≤ 35 seconds (30s refresh interval + up to 5s jitter) — no deployment, no restart.
 
 | Scenario | Action |
 |----------|--------|
-| V2 routing issues | Set `UseVirtualQueue = false` — reverts live decisions to V1 immediately while `EnableVirtualQueueSync` can stay enabled to keep V2 warm for retry. |
+| V2 routing issues | Set `UseVirtualQueue = false` — reverts live decisions to the actual-queue calculator immediately while `EnableVirtualQueueSync` can stay enabled to keep the V2 snapshot warm for retry. |
 | V2 sync issues | Set `UseVirtualQueue = false`, then set `EnableVirtualQueueSync = false` — stops fetching V2 state on inference instances and returns to V1-only sync. |
 | Virtual queue fetch issues (e.g., RU spike) | Set `UseVirtualQueue = false`, set `EnableVirtualQueueSync = false`, then set `EnableVirtualQueueQuery = false` — disables V2 in reverse dependency order. The last successful V2 snapshot may remain cached in memory, so this is safe only when V2 consumers are also disabled or the cache is explicitly cleared. |
-| Full rollback | Set all three flags to `false` — system returns to pure V1 behaviour. |
+| Full rollback | Set all three flags to `false` — system returns to pure actual-queue behaviour. |
 
 ---
 
@@ -759,8 +783,8 @@ flowchart TB
     C -- "merges feed-range partials" --> C
     C -->|"merged VirtualQueue[]"| D["gRPC"]
     D -->|"VirtualQueue[]"| E["Client"]
-    E --> F["ModelRouterV2"]
-    F -->|"interpolation"| G["GetQueuePosition"]
+    E --> F["ModelRouter"]
+    F -->|"virtual queue calculator + interpolation"| G["GetQueuePosition"]
     F -.->|"global queue map"| H["Router State"]
 ```
 
@@ -787,8 +811,9 @@ Key differences:
 | `Shared/ModelRouting/Storage/External/VirtualQueue.cs` | `External.VirtualQueue` Cosmos DB serialization record |
 | `Shared/ModelRouting/ModelRoutingAggregationsCacheV2.cs` | `ModelRoutingAggregationsCacheV2` record (or added to existing `ModelRoutingAggregations.cs`) |
 | `Shared/ModelRouting/ModelRoutingAggregationsV2.cs` | `ModelRoutingAggregationsV2` record (or added to existing `ModelRoutingAggregations.cs`) |
-| `Shared/Inference/ModelRouting/ModelRouterV2.cs` | V2 router with time-based interpolation |
-| `Shared/Inference/ModelRouting/VersionedModelRouter.cs` | Delegating router that keeps both sync paths warm and switches live decisions based on `UseVirtualQueue` |
+| `Shared/Inference/ModelRouting/IQueueCalculator.cs` | Queue-calculator abstraction for V1/V2 queue math |
+| `Shared/Inference/ModelRouting/ActualQueueCalculator.cs` | Existing exact-count queue calculator used by `ModelRouter` |
+| `Shared/Inference/ModelRouting/VirtualQueueCalculator.cs` | V2 virtual-queue calculator with time-based interpolation |
 
 ### Modified Files
 
@@ -807,11 +832,12 @@ Key differences:
 | `Shared/Inference/ModelRouting/IModelRoutingAggregationsClient.cs` | Add `GetAggregatedStateV2Async` and inference-side `ModelRoutingAggregationsV2` record |
 | `Shared/Inference/ModelRouting/ModelRoutingAggregationsClient.cs` | Add V2 client method and `ToInternalVirtualQueue` mapper |
 | `Shared/Inference/ModelRouting/IRequestAllocationManager.cs` | Split sync from allocation (`SyncAggregations`, `SyncAggregationsV2`, `AllocateQueuedRequests`) |
+| `Shared/Inference/ModelRouting/ModelRouter.cs` | Keep single router; delegate queue math to `IQueueCalculator` and remove duplicated V2 lifecycle/logging code |
 | `Shared/Inference/ModelRouting/ModelRoutingService.cs` | Change `IOptions` to `IOptionsMonitor`, always sync V1, optionally sync V2 behind `EnableVirtualQueueSync`, then allocate once |
 | `Shared/ModelRouting/ModelRoutingOptions.cs` | Add `EnableVirtualQueueQuery` flag |
 | `Shared/Inference/ModelRouting/ModelRoutingWithAuthOptions.cs` | Add `EnableVirtualQueueSync` and `UseVirtualQueue` flags |
 | `Shared/Inference/ModelRouting/ModelRoutingLeaseFactory.cs` | Change `[FromKeyedServices("ModelRouter")] IModelRouter` to non-keyed `IModelRouter` |
-| `Shared/Inference/AppStartup.cs` | Register `ModelRouterV2`, `VersionedModelRouter` as non-keyed `IModelRouter` |
+| `Shared/Inference/AppStartup.cs` | Register `ActualQueueCalculator`, `VirtualQueueCalculator`, and non-keyed `ModelRouter` |
 
 ---
 
@@ -831,32 +857,32 @@ Rollout:
 3. Validate RU, latency, gRPC payload size, and V2 endpoint health
 4. Enable `EnableVirtualQueueQuery` in production
 
-### Phase/PR2 — V1 Refactor To Split Sync From Allocation
+### Phase/PR2 — Actual-Queue Refactor To Split Sync From Allocation
 
 Scope:
-- Refactor `IRequestAllocationManager`, `ModelRouter`, and `ModelRoutingService` so V1 uses `SyncAggregations(...)` followed by `AllocateQueuedRequests()`.
-- Do not introduce live V2 routing behavior in this PR.
+- Refactor `IRequestAllocationManager`, `ModelRouter`, and `ModelRoutingService` so the actual-queue path uses `SyncAggregations(...)` followed by `AllocateQueuedRequests()`.
+- Do not introduce live virtual-queue calculator behavior in this PR.
 
 Rollout:
 1. Deploy with no flag change
-2. Validate that V1 routing remains identical
+2. Validate that actual-queue behavior remains identical
 
 ### Phase/PR3 — Passive V2 Inference Snapshot Path
 
 Scope:
 - Add inference-side `ModelRoutingAggregationsV2`, `GetAggregatedStateV2Async`, `GlobalVirtualQueues`, `SyncGlobalState`, `EnableVirtualQueueSync`, and the background-service dual-sync path.
-- Constraint: when `UseVirtualQueue = false`, V2 fetch/sync must be best-effort and must not block V1 allocation if it fails.
+- Constraint: when `UseVirtualQueue = false`, V2 fetch/sync must be best-effort and must not block actual-queue allocation if it fails.
 
 Rollout:
 1. Deploy with `EnableVirtualQueueSync = false`
 2. Enable `EnableVirtualQueueSync` in staging
-3. Validate V2 fetch health and memory/cpu overhead while allocation still follows V1
+3. Validate V2 fetch health and memory/cpu overhead while allocation still follows `ActualQueueCalculator`
 4. Enable `EnableVirtualQueueSync` in production
 
-### Phase/PR4 — Live V2 Router Switch
+### Phase/PR4 — Live V2 Queue-Calculator Switch
 
 Scope:
-- Add `ModelRouterV2`, `VersionedModelRouter`, DI registration changes, non-keyed `IModelRouter` wiring, and `UseVirtualQueue`.
+- Add `IQueueCalculator`, `ActualQueueCalculator`, `VirtualQueueCalculator`, `ModelRouter` refactor, DI registration changes, and `UseVirtualQueue`.
 - Constraint: depends on PR3 already being deployed and `EnableVirtualQueueSync = true`.
 
 Rollout:
@@ -868,14 +894,14 @@ Rollout:
 ### Phase/PR5 — Cleanup
 
 Scope:
-1. Remove `ModelRouter` (V1) class and `VersionedModelRouter`
+1. Remove `ActualQueueCalculator`
 2. Remove `GetQueuedRequestsByFeedRangesAsync` from `IModelRoutingStorageProvider` and implementation
 3. Remove `BuildAggregatedQueuedRequests` from aggregator
 4. Remove `GetAggregatedView(instanceId)`, `ModelRoutingAggregationsCache`, and V1 gRPC endpoint
 5. Remove `RemoteModelRoutingRequests` from `IModelRoutingState`
 6. Remove `SyncWithRemoteState(ModelRoutingAggregations)` from state
 7. Remove `EnableVirtualQueueQuery`, `EnableVirtualQueueSync`, and `UseVirtualQueue` flags
-8. Rename `ModelRouterV2` → `ModelRouter`, `ModelRoutingAggregationsCacheV2` → `ModelRoutingAggregationsCache`
+8. Inline `VirtualQueueCalculator` as the only queue implementation if the extra abstraction is no longer needed, and rename `ModelRoutingAggregationsCacheV2` → `ModelRoutingAggregationsCache`
 
 Rollout:
 1. Only after sufficient production bake time on V2
@@ -905,35 +931,39 @@ Flip flags in reverse dependency order via Azure App Configuration. Changes prop
 - `ProcessAggregationsCoreAsync` with `EnableVirtualQueueQuery = true`: verify `cachedAggregationsV2` is populated.
 - `ProcessAggregationsCoreAsync` with `EnableVirtualQueueQuery = false`: verify `cachedAggregationsV2` is not refreshed; before first V2 fetch it remains empty, and after a prior successful V2 fetch it retains the last snapshot unless explicitly cleared.
 
-**Router V2:**
+**VirtualQueueCalculator:**
 - `GetGlobalNumberOfRequestsAhead` interpolation:
-  - `createdAt` before `FirstCreatedAt` → returns 0 (oldest, first to be served)
-  - `createdAt` after `LastCreatedAt` → returns full `QueuedCount` (newest, everyone ahead)
+  - `createdAt` after `LastCreatedAt` → returns 0 (newest, served first under LIFO)
+  - `createdAt` before `FirstCreatedAt` → returns full `QueuedCount` (oldest, everyone ahead)
   - `createdAt` at midpoint → returns ~half of `QueuedCount`
-  - Single-element queue (`FirstCreatedAt == LastCreatedAt`) → returns `QueuedCount - 1`
+  - Single-element queue (`FirstCreatedAt == LastCreatedAt`) with `createdAt` matching → returns 0
+  - Single-element queue with `createdAt` not matching the timestamp → returns 0 (guards against division by zero in interpolation)
 - `GetQueuePosition`: verify it is derived from the global snapshot only and does not add local queued requests on top.
 - `GetQueuedCount(scenarioId, isBackfill)`: verify it returns the global queued count with correct backfill filtering.
+- Empty virtual queue (no queued requests): `GetQueuePosition` returns 1 (only self) and `GetQueuedCount` returns 0.
 - Visibility lag scenario: a newly queued local request that is not yet present in the global snapshot should not affect V2 queue position or queue-full checks until the next successful sync.
-- `AllocateQueuedRequests`: verify allocation order respects priority.
-- Existing `ModelRouter` V1 tests remain unchanged.
+- Existing `ModelRouter` allocation tests still pass when `UseVirtualQueue = true`.
 
-**VersionedModelRouter:**
-- `SyncAggregations` always updates V1.
-- `SyncAggregationsV2` always updates V2.
-- `AllocateQueuedRequests` delegates to V2 when `UseVirtualQueue = true`.
-- `AllocateQueuedRequests` delegates to V1 when `UseVirtualQueue = false`.
-- Runtime flag change → switches allocation implementation on next call without requiring a cold sync.
+**ActualQueueCalculator:**
+- Existing `ModelRouter` exact-count queue position and queue-full tests remain unchanged.
+
+**ModelRouter queue-calculator selection:**
+- `SyncAggregations` updates actual-queue state regardless of `UseVirtualQueue`.
+- `SyncAggregationsV2` updates virtual-queue state regardless of `UseVirtualQueue`.
+- When `UseVirtualQueue = true`, allocation decisions reflect queue position and queued-count values from `VirtualQueueCalculator`.
+- When `UseVirtualQueue = false`, allocation decisions reflect queue position and queued-count values from `ActualQueueCalculator`.
+- Runtime flag change switches calculators on the next call without requiring router re-creation.
 
 **Background service:**
-- `EnableVirtualQueueSync = false` → V1 snapshot is refreshed, V2 fetch is skipped, and allocation runs once.
-- `EnableVirtualQueueSync = true` → V1 and V2 snapshots are both refreshed, and allocation still runs exactly once.
-- V2 fetch failure while `UseVirtualQueue = false` → V1 allocation still runs for that tick.
+- `EnableVirtualQueueSync = false` → actual-queue snapshot is refreshed, V2 fetch is skipped, and allocation runs once.
+- `EnableVirtualQueueSync = true` → actual-queue and virtual-queue snapshots are both refreshed, and allocation still runs exactly once.
+- V2 fetch failure while `UseVirtualQueue = false` → actual-queue allocation still runs for that tick.
 - V2 fetch failure while `UseVirtualQueue = true` → allocation continues using the last successful V2 snapshot.
 
 ### Staging Validation
 
 - Virtual queue results match expected aggregation from the actual queue query.
 - RU reduction consistent with benchmarks.
-- Queue position estimation produces allocation behaviour comparable to V1 under normal load.
+- Queue position estimation produces allocation behaviour comparable to the existing exact-count path under normal load.
 - No 429 throttling.
 - gRPC payload size reduction measurable.
